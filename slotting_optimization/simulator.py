@@ -22,9 +22,7 @@ class Simulator:
     """
 
     def simulate(self, order_book: OrderBook, warehouse: Warehouse, item_locations: ItemLocations) -> Tuple[float, List[float]]:
-        df: pl.DataFrame = order_book.to_df()
-        # Ensure sorted by timestamp
-        df = df.sort("timestamp")
+        df: pl.DataFrame = order_book.to_df().sort("timestamp")
         total_distance = 0.0
         per_order: List[float] = []
 
@@ -33,31 +31,55 @@ class Simulator:
         if start is None or end is None:
             raise ValueError("Warehouse must define start_point and end_point")
 
-        rows = df.to_dicts()
-        for idx, r in enumerate(rows):
-            item_id = r["item_id"]
-            loc = item_locations.get_location(item_id)
+        n = df.height
+        if n == 0:
+            return 0.0, []
+
+        get_loc = item_locations.get_location
+        get_dist = warehouse.get_distance
+
+        # Build legs: each order contributes start->loc and loc->end with an order_idx
+        legs_records = []
+        item_ids = df.get_column("item_id").to_list()
+        for idx, item_id in enumerate(item_ids):
+            loc = get_loc(item_id)
             if loc is None:
                 raise ValueError(f"No location for item {item_id}")
+            legs_records.append({"order_idx": idx, "from": start, "to": loc})
+            legs_records.append({"order_idx": idx, "from": loc, "to": end})
 
-            # start -> loc
-            d1 = warehouse.get_distance(start, loc)
-            if d1 is None:
-                raise ValueError(f"Missing distance from {start} to {loc}")
-            # loc -> end
-            d2 = warehouse.get_distance(loc, end)
-            if d2 is None:
-                raise ValueError(f"Missing distance from {loc} to {end}")
+        # Add return legs between orders: end->start repeated n-1 times (no order_idx)
+        for _ in range(max(0, n - 1)):
+            legs_records.append({"order_idx": None, "from": end, "to": start})
 
-            order_dist = float(d1) + float(d2)
-            total_distance += order_dist
-            per_order.append(order_dist)
+        legs_df = pl.DataFrame(legs_records)
 
-            # If there is another order, add end -> start travel
-            if idx != len(rows) - 1:
-                ret = warehouse.get_distance(end, start)
-                if ret is None:
-                    raise ValueError(f"Missing distance from {end} to {start}")
-                total_distance += float(ret)
+        # Build distance table for unique pairs used in legs_df
+        unique_pairs = legs_df.select(["from", "to"]).unique()
+        pairs = unique_pairs.to_dicts()
+        dist_recs = []
+        for p in pairs:
+            d = get_dist(p["from"], p["to"])
+            if d is None:
+                raise ValueError(f"Missing distance from {p['from']} to {p['to']}")
+            dist_recs.append({"from": p["from"], "to": p["to"], "distance": float(d)})
+
+        dist_df = pl.DataFrame(dist_recs)
+
+        # Join legs with distances
+        joined = legs_df.join(dist_df, on=["from", "to"], how="left")
+        if joined.filter(pl.col("distance").is_null()).height > 0:
+            raise ValueError("Some legs have no matching distance after join")
+
+        # Per-order distances: group by order_idx and sum
+        per_order_df = (
+            joined.filter(pl.col("order_idx").is_not_null())
+            .group_by("order_idx")
+            .agg(pl.col("distance").sum())
+            .sort("order_idx")
+        )
+        per_order = [float(x) for x in per_order_df.get_column("distance").to_list()]
+
+        total_distance = float(joined.get_column("distance").sum())
 
         return total_distance, per_order
