@@ -10,9 +10,10 @@ class Warehouse:
     an optional distance mapping between pairs of locations.
     """
 
-    def __init__(self, locations: Optional[Iterable[str]] = None, start_point_id: Optional[str] = None):
+    def __init__(self, locations: Optional[Iterable[str]] = None, start_point_id: Optional[str] = None, end_point_id: Optional[str] = None):
         self._locations: List[str] = list(locations or [])
         self._start_point_id: Optional[str] = start_point_id
+        self._end_point_id: Optional[str] = end_point_id
         # Optional mapping (from_id, to_id) -> distance (float)
         self._distance_map: Dict[Tuple[str, str], float] = {}
 
@@ -28,6 +29,15 @@ class Warehouse:
     @property
     def start_point(self) -> Optional[str]:
         return self._start_point_id
+
+    def set_end_point(self, end_point_id: str) -> None:
+        if end_point_id not in self._locations:
+            self.add_location(end_point_id)
+        self._end_point_id = end_point_id
+
+    @property
+    def end_point(self) -> Optional[str]:
+        return self._end_point_id
 
     def locations(self) -> List[str]:
         return list(self._locations)
