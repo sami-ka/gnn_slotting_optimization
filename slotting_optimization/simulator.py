@@ -222,3 +222,76 @@ def build_matrices(order_book: OrderBook, item_locations: ItemLocations, warehou
             item_loc_mat[item_index[it], loc_index[loc]] = 1
 
     return loc_mat, seq_mat, item_loc_mat, locs, items
+
+
+def build_matrices_fast(order_book: OrderBook, item_locations: ItemLocations, warehouse: Warehouse):
+    """Faster, vectorized implementation of build_matrices.
+
+    Strategies used:
+    - Build `loc_mat` by filling from warehouse's distance map (no nested LxL loops)
+    - Use Polars windowed `shift` to compute next-item within each order, then groupby to count unique pairs
+    - Use NumPy advanced indexing to construct `item_loc_mat` efficiently
+    Returns same tuple as `build_matrices`.
+    """
+    df: pl.DataFrame = order_book.to_df()
+
+    # Locations and index mapping
+    locs = warehouse.locations()
+    m = len(locs)
+    loc_index = {loc: i for i, loc in enumerate(locs)}
+
+    # Location matrix: fill from distance map (only iterate defined distances)
+    loc_mat = np.full((m, m), np.nan, dtype=float)
+    # Accessing private attribute _distance_map (module-local optimization)
+    for (a, b), d in getattr(warehouse, "_distance_map", {}).items():
+        if a in loc_index and b in loc_index:
+            loc_mat[loc_index[a], loc_index[b]] = float(d)
+
+    # Items set and mapping
+    mapping = item_locations.to_dict()
+    items_set = set(df.get_column("item_id").to_list()) | set(mapping.keys())
+    items = sorted(items_set)
+    n = len(items)
+    item_index = {it: idx for idx, it in enumerate(items)}
+
+    # Sequence matrix: use Polars windowed shift + groupby to count pairs
+    seq_mat = np.zeros((n, n), dtype=np.int64)
+    if df.height > 0:
+        # Sort per order and compute next item per-order
+        df_sorted = df.sort(["order_id", "timestamp"]) 
+        df_next = df_sorted.with_columns(
+            pl.col("item_id").shift(-1).over("order_id").alias("next_item")
+        )
+        pairs = (
+            df_next.filter(pl.col("next_item").is_not_null())
+            .group_by(["item_id", "next_item"])  # counts per pair
+            .agg(pl.count().alias("cnt"))
+        )
+        # Vectorized mapping from item ids to integer indices and assignment
+        if pairs.height > 0:
+            # Temporary mapping table for items -> idx
+            items_df = pl.DataFrame({"item": items, "idx": list(range(n))})
+            # Join to get integer indices for item_id and next_item
+            pairs = pairs.join(items_df.rename({"item": "item_id", "idx": "ai"}), on="item_id", how="inner")
+            pairs = pairs.join(items_df.rename({"item": "next_item", "idx": "bi"}), on="next_item", how="inner")
+
+            ai_arr = pairs.get_column("ai").to_numpy().astype(np.int64)
+            bi_arr = pairs.get_column("bi").to_numpy().astype(np.int64)
+            cnt_arr = pairs.get_column("cnt").to_numpy().astype(np.int64)
+
+            # Vectorized assignment using numpy indexing
+            seq_mat[ai_arr, bi_arr] = cnt_arr
+
+    # Item x Location matrix using vectorized indexing
+    item_loc_mat = np.zeros((n, m), dtype=np.int64)
+    # Build lists of (item_idx, loc_idx)
+    item_idxs = []
+    loc_idxs = []
+    for it, loc in mapping.items():
+        if it in item_index and loc in loc_index:
+            item_idxs.append(item_index[it])
+            loc_idxs.append(loc_index[loc])
+    if item_idxs:
+        item_loc_mat[np.array(item_idxs, dtype=np.int64), np.array(loc_idxs, dtype=np.int64)] = 1
+
+    return loc_mat, seq_mat, item_loc_mat, locs, items
