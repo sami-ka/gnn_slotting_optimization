@@ -44,6 +44,22 @@ def _(data, torch):
 
 @app.cell
 def _():
+    # Add project root to sys.path (safe to paste in a notebook cell)
+    from pathlib import Path
+    import sys
+
+    root = Path.cwd()
+    # climb parents until we find the package folder
+    while not (root / "slotting_optimization").exists() and root.parent != root:
+        root = root.parent
+
+    sys.path.insert(0, str(root))
+    print("Added to sys.path:", root)
+    return
+
+
+@app.cell
+def _():
     from slotting_optimization.generator import DataGenerator
     from slotting_optimization.order_book import OrderBook
     from slotting_optimization.item_locations import ItemLocations
@@ -54,7 +70,42 @@ def _():
     ob, il, w = samples[0]
     # each logical order id should appear between min and max times
     df = ob.to_df()
+
+
+    return il, ob, w
+
+
+@app.cell
+def _(il, ob, w):
+    from slotting_optimization.simulator import build_matrices_fast
+
+    loc_mat, seq_mat, item_loc_mat, locs, items = build_matrices_fast(ob, il, w)
+
+
     return
+
+
+app._unparsable_cell(
+    r"""
+    import numpy as np
+    loc_mat.shape[0]
+    nb_loc = 
+    """,
+    name="_"
+)
+
+
+app._unparsable_cell(
+    r"""
+    edge_index_ = torch.tensor([[0, 1],
+                               [1, 0],
+                               [1, 2],
+                               [2, 1]], dtype=torch.long)
+    x_loc_item = torch.tensor([[1]*], dtype=torch.float)
+    y1 = torch.tensor([10.2], dtype=torch.float)
+    """,
+    name="_"
+)
 
 
 if __name__ == "__main__":
