@@ -58,10 +58,15 @@ def bench_once(fn, ob, il, w):
 
 def run_bench():
     scenarios = [
-        (50, 100, 2000),
-        (100, 200, 5000),
-        (200, 400, 10000),
+        (50, 40, 2000),
+        (100, 80, 5000),
+        (200, 160, 10000),
     ]
+
+    # Validate scenario feasibility for unique item locations
+    for (n_locs, n_items, _) in scenarios:
+        if n_items > n_locs:
+            raise ValueError("Benchmark scenarios require n_items <= n_locs due to unique item-location constraint")
 
     for (n_locs, n_items, n_orders) in scenarios:
         print(f"\nScenario: locs={n_locs}, items={n_items}, orders={n_orders}")

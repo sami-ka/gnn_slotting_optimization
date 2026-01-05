@@ -15,8 +15,18 @@ class ItemLocations:
 
     @classmethod
     def from_records(cls, records: Iterable[Dict[str, str]]) -> "ItemLocations":
-        m = {str(r["item_id"]): str(r["location_id"]) for r in records}
-        return cls(m)
+        mapping: Dict[str, str] = {}
+        loc_to_item: Dict[str, str] = {}
+        for r in records:
+            item = str(r["item_id"])
+            loc = str(r["location_id"])
+            # Allow repeated records for same item->same-loc, but disallow multiple items at same location
+            existing = loc_to_item.get(loc)
+            if existing is not None and existing != item:
+                raise ValueError(f"Location '{loc}' already assigned to item '{existing}'; cannot assign to '{item}'")
+            mapping[item] = loc
+            loc_to_item[loc] = item
+        return cls(mapping)
 
     @classmethod
     def load_csv(cls, path: str) -> "ItemLocations":

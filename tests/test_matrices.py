@@ -26,7 +26,7 @@ def test_build_matrices_basic():
     il = ItemLocations.from_records([
         {"item_id": "sku1", "location_id": "A"},
         {"item_id": "sku2", "location_id": "B"},
-        {"item_id": "sku3", "location_id": "A"},
+        {"item_id": "sku3", "location_id": "end"},
     ])
 
     # Orders: two orders with sequences
@@ -64,5 +64,5 @@ def test_build_matrices_basic():
     assert item_loc_mat[items.index("sku1"), locs.index("A")] == 1
     # sku2 in B
     assert item_loc_mat[items.index("sku2"), locs.index("B")] == 1
-    # sku3 in A
-    assert item_loc_mat[items.index("sku3"), locs.index("A")] == 1
+    # sku3 in end
+    assert item_loc_mat[items.index("sku3"), locs.index("end")] == 1
