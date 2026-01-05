@@ -167,3 +167,58 @@ class Simulator:
             per_order.append(float(d1 + d2))
 
         return total_distance, per_order
+
+
+def build_matrices(order_book: OrderBook, item_locations: ItemLocations, warehouse: Warehouse):
+    """Build three matrices from inputs:
+
+    - loc_mat: (L x L) numpy array of distances between warehouse locations (np.nan where missing)
+    - seq_mat: (I x I) integer numpy array where seq_mat[i,j] is the count of item i -> item j sequences within orders
+    - item_loc_mat: (I x L) binary numpy array where item_loc_mat[i,j]==1 iff item i is assigned to location j
+
+    The function returns a tuple (loc_mat, seq_mat, item_loc_mat, locs, items) where
+    `locs` and `items` are the lists giving the row/column ordering used for the matrices.
+    """
+    df: pl.DataFrame = order_book.to_df()
+
+    # Locations (keep warehouse.locations() ordering)
+    locs = warehouse.locations()
+    m = len(locs)
+    loc_index = {loc: i for i, loc in enumerate(locs)}
+
+    # Location x Location matrix (float) with np.nan for missing distances
+    loc_mat = np.full((m, m), np.nan, dtype=float)
+    for i, a in enumerate(locs):
+        for j, b in enumerate(locs):
+            d = warehouse.get_distance(a, b)
+            if d is not None:
+                loc_mat[i, j] = float(d)
+
+    # Items: include items present in orders or in the item_locations mapping
+    items_set = set(df.get_column("item_id").to_list()) | set(item_locations.to_dict().keys())
+    items = sorted(items_set)
+    n = len(items)
+    item_index = {it: idx for idx, it in enumerate(items)}
+
+    # Item x Item sequence matrix
+    seq_mat = np.zeros((n, n), dtype=np.int64)
+
+    if df.height > 0:
+        # Build per-order item sequences by timestamp without using list aggregation (compatibility across polars versions)
+        order_items = {}
+        for rec in df.sort("timestamp").to_dicts():
+            oid = rec["order_id"]
+            order_items.setdefault(oid, []).append(str(rec["item_id"]))
+        for item_list in order_items.values():
+            for a, b in zip(item_list, item_list[1:]):
+                seq_mat[item_index[a], item_index[b]] += 1
+
+    # Item x Location binary matrix
+    item_loc_mat = np.zeros((n, m), dtype=np.int64)
+    mapping = item_locations.to_dict()
+    for it in items:
+        loc = mapping.get(it)
+        if loc is not None and loc in loc_index:
+            item_loc_mat[item_index[it], loc_index[loc]] = 1
+
+    return loc_mat, seq_mat, item_loc_mat, locs, items
