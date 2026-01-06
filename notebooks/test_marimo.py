@@ -66,11 +66,10 @@ def _():
     from slotting_optimization.warehouse import Warehouse
 
     gen = DataGenerator()
-    samples = gen.generate_samples(5, 20, 2, 4, n_samples=1, distances_fixed=True, seed=5)
+    samples = gen.generate_samples(5, 5, 20, 2, 4, n_samples=1, distances_fixed=True, seed=5)
     ob, il, w = samples[0]
     # each logical order id should appear between min and max times
     df = ob.to_df()
-
 
     return il, ob, w
 
@@ -81,28 +80,45 @@ def _(il, ob, w):
 
     loc_mat, seq_mat, item_loc_mat, locs, items = build_matrices_fast(ob, il, w)
 
+    return item_loc_mat, loc_mat, locs
 
+
+@app.cell
+def _(locs):
+    import numpy as np
+
+    nb_loc = len(locs)
+    return (np,)
+
+
+@app.cell
+def _(loc_mat):
+    loc_mat
+    return
+
+
+@app.cell
+def _(item_loc_mat):
+    item_loc_mat
+    return
+
+
+@app.cell
+def _(item_loc_mat, loc_mat, np):
+    np.concat([loc_mat,item_loc_mat])
     return
 
 
 app._unparsable_cell(
     r"""
-    import numpy as np
-    loc_mat.shape[0]
-    nb_loc = 
-    """,
-    name="_"
-)
 
-
-app._unparsable_cell(
-    r"""
-    edge_index_ = torch.tensor([[0, 1],
-                               [1, 0],
-                               [1, 2],
-                               [2, 1]], dtype=torch.long)
-    x_loc_item = torch.tensor([[1]*], dtype=torch.float)
-    y1 = torch.tensor([10.2], dtype=torch.float)
+        edge_index_ = torch.tensor([[0, 1],
+                                   [1, 0],
+                                   [1, 2],
+                                   [2, 1]], dtype=torch.long)
+        x_loc_item = torch.tensor([[1]*], dtype=torch.float)
+        y1 = torch.tensor([10.2], dtype=torch.float)
+    
     """,
     name="_"
 )

@@ -6,7 +6,7 @@ from slotting_optimization.models import Order
 from slotting_optimization.order_book import OrderBook
 from slotting_optimization.item_locations import ItemLocations
 from slotting_optimization.warehouse import Warehouse
-from slotting_optimization.simulator import build_matrices
+from slotting_optimization.simulator import build_matrices, build_matrices_fast
 
 
 def make_order(order_id, item_id, ts):
@@ -66,3 +66,48 @@ def test_build_matrices_basic():
     assert item_loc_mat[items.index("sku2"), locs.index("B")] == 1
     # sku3 in end
     assert item_loc_mat[items.index("sku3"), locs.index("end")] == 1
+
+
+def test_build_matrices_fast_loc_mat_not_none():
+    """Regression test: ensure loc_mat is not None after build_matrices_fast
+
+    This test catches the bug where loc_mat = np.fill_diagonal(loc_mat, 0)
+    overwrites loc_mat with None since np.fill_diagonal returns None.
+    """
+    from slotting_optimization.generator import DataGenerator
+
+    # Generate sample data
+    gen = DataGenerator()
+    samples = gen.generate_samples(
+        n_locations=5, nb_items=5, n_orders=10,
+        min_items_per_order=1, max_items_per_order=2,
+        n_samples=1, seed=42
+    )
+    ob, il, w = samples[0]
+
+    # Call build_matrices_fast
+    loc_mat, seq_mat, item_loc_mat, locs, items = build_matrices_fast(ob, il, w)
+
+    # Validate loc_mat is not None
+    assert loc_mat is not None, "loc_mat should not be None"
+
+    # Validate loc_mat has correct shape (L×L)
+    # Should be (n_locations + 2) because of start and end points
+    expected_size = 7  # 5 locations + start + end
+    assert loc_mat.shape == (expected_size, expected_size), \
+        f"loc_mat shape should be ({expected_size}, {expected_size}), got {loc_mat.shape}"
+
+    # Validate diagonal is all zeros
+    diagonal = np.diag(loc_mat)
+    assert np.all(diagonal == 0), \
+        f"Diagonal should be all zeros, got {diagonal}"
+
+    # Validate off-diagonal has valid distances (not all NaN)
+    # Since generator creates distances for all pairs, we expect no NaN values
+    off_diagonal_mask = ~np.eye(expected_size, dtype=bool)
+    off_diagonal_values = loc_mat[off_diagonal_mask]
+    assert not np.all(np.isnan(off_diagonal_values)), \
+        "Off-diagonal should have valid distance values"
+    # All off-diagonal values should be positive (distances are between 1.0 and 10.0)
+    assert np.all(off_diagonal_values > 0), \
+        f"Off-diagonal distances should be positive, got min={off_diagonal_values.min()}"
