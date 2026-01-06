@@ -294,4 +294,5 @@ def build_matrices_fast(order_book: OrderBook, item_locations: ItemLocations, wa
     if item_idxs:
         item_loc_mat[np.array(item_idxs, dtype=np.int64), np.array(loc_idxs, dtype=np.int64)] = 1
 
-    return np.fill_diagonal(loc_mat, 0), seq_mat, item_loc_mat, locs, items
+    loc_mat = np.fill_diagonal(loc_mat, 0)
+    return loc_mat, seq_mat, item_loc_mat, locs, items
