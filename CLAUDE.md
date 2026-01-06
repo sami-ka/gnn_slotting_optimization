@@ -21,23 +21,23 @@ uv add <package-name>
 ### Testing
 ```bash
 # Run all tests
-pytest
+uv run pytest ./tests
 
 # Run specific test file
-pytest tests/test_simulator.py
+uv run pytest tests/test_simulator.py
 
 # Run with verbose output
-pytest -v
+uv run pytest -v
 
 # Run performance benchmarks
-pytest tests/test_simulator_perf.py -v
+uv run pytest tests/test_simulator_perf.py -v
 ```
 
 ### Code Quality
 ```bash
 # Format and lint code with ruff
-ruff check .
-ruff format .
+uv run ruff check .
+uv run ruff format .
 ```
 
 ### Notebooks
@@ -46,6 +46,34 @@ The project uses Marimo for interactive notebooks:
 # Run marimo notebook
 marimo edit notebooks/test_marimo.py
 ```
+
+## Development Workflow
+
+### Test-First Development (Required)
+
+This project follows strict test-first development. **Always write tests before implementing features.**
+
+**Before any implementation:**
+1. **Challenge the user on test cases**: Ask specific questions about what should be tested:
+   - What are the expected inputs and outputs?
+   - What edge cases should be covered?
+   - What error conditions need handling?
+   - Are there performance requirements to validate?
+
+2. **Write tests first**: Create test cases covering:
+   - **Happy path**: Normal, expected usage
+   - **Edge cases**: Boundary conditions, empty inputs, single items, large datasets
+   - **Error handling**: Invalid inputs, missing data, constraint violations
+   - **Integration**: How components interact (e.g., OrderBook → Simulator → results)
+   - **Performance**: When relevant (use `test_*_perf.py` pattern for benchmarks)
+
+3. **Implementation only after tests exist**: Do not implement functionality until test cases are written and the user has approved the test plan.
+
+**Example test planning questions:**
+- "For this new validation function, should it raise an exception or return False for invalid inputs?"
+- "What should happen when the input DataFrame is empty?"
+- "Do we need to test performance for datasets with >10k items?"
+- "Should this work with both ISO timestamp strings and epoch timestamps?"
 
 ## Architecture Overview
 
