@@ -1,6 +1,6 @@
-- use the big matrix to build the GNN 
-- simulate the distance for order preparation 
+- use the big matrix to build the data for GNN -> ask to use arguments not being the big matrix to build it
+- build a GNN
 - train the GNN
 - invert the GNN to have best values on edges for the item loc part
-- look at the distance
+- look at the distance of best solution from invert optimization
 - iterate
