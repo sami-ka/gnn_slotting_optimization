@@ -27,10 +27,9 @@ def _(Data, torch):
                                [1, 0],
                                [1, 2],
                                [2, 1]], dtype=torch.long)
-    x1 = torch.tensor([[-1], [0], [1]], dtype=torch.float)
-    y1 = torch.tensor([10.2], dtype=torch.float)
 
-    data1 = Data(x=x1, edge_index=edge_index1.t().contiguous(), y=y1)
+
+    data1 = Data(edge_index=edge_index1.t().contiguous())
     data1
     return
 
