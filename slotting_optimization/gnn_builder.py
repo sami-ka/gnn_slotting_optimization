@@ -1,11 +1,16 @@
 """GNN builder functions for converting combined matrices to PyTorch Geometric graphs."""
 
 from __future__ import annotations
-from typing import Tuple
+from typing import Tuple, Optional, Callable, TYPE_CHECKING
 
 import numpy as np
 import torch
 from torch_geometric.data import Data
+
+if TYPE_CHECKING:
+    from slotting_optimization.order_book import OrderBook
+    from slotting_optimization.item_locations import ItemLocations
+    from slotting_optimization.warehouse import Warehouse
 
 
 def _validate_inputs(combined_matrix: np.ndarray, metadata: dict, validate_nan: bool) -> Tuple[int, int, int]:
@@ -58,7 +63,11 @@ def _validate_inputs(combined_matrix: np.ndarray, metadata: dict, validate_nan: 
 def build_graph_sparse(
     combined_matrix: np.ndarray,
     metadata: dict,
-    validate_nan: bool = True
+    validate_nan: bool = True,
+    simulator: Optional[Callable] = None,
+    order_book: Optional['OrderBook'] = None,
+    item_locations: Optional['ItemLocations'] = None,
+    warehouse: Optional['Warehouse'] = None
 ) -> Data:
     """Build sparse graph with edges only where matrix[i,j] != 0.
 
@@ -70,23 +79,45 @@ def build_graph_sparse(
         combined_matrix: Combined matrix from build_combined_matrix(), shape (I+L, I+L)
         metadata: Metadata dictionary with keys: n_items, n_locs, n_storage, items, locs
         validate_nan: If True, raise ValueError if any NaN values detected
+        simulator: Optional callable that takes (order_book, warehouse, item_locations)
+                   and returns (total_distance, per_order_distances).
+                   Use Simulator().simulate or Simulator().simulate_sparse_matrix
+        order_book: OrderBook for simulation (required if simulator provided)
+        item_locations: ItemLocations for simulation (required if simulator provided)
+        warehouse: Warehouse for simulation (required if simulator provided)
 
     Returns:
         torch_geometric.data.Data object with:
             - edge_index: [2, num_edges] tensor of edge indices
             - edge_attr: [num_edges, 1] tensor of edge weights
             - num_nodes: Total number of nodes (n_items + n_locs)
-            - n_items, n_locs, n_storage, items, locs: Metadata attributes
+            - n_items, n_locs, n_storage, items_list, locs_list: Metadata attributes
+            - y: [1] tensor containing total_distance (if simulator provided)
 
     Raises:
         KeyError: If required metadata key is missing
-        ValueError: If matrix shape doesn't match metadata or NaN detected
+        ValueError: If matrix shape doesn't match metadata, NaN detected,
+                    or incomplete simulation parameters
 
     Example:
+        >>> # Without simulation target
         >>> combined, metadata = build_combined_matrix(ob, il, w)
         >>> data = build_graph_sparse(combined, metadata)
         >>> print(data.edge_index.shape)
         torch.Size([2, 87])
+
+        >>> # With simulation target
+        >>> from slotting_optimization.simulator import Simulator
+        >>> sim = Simulator()
+        >>> data = build_graph_sparse(
+        ...     combined, metadata,
+        ...     simulator=sim.simulate,
+        ...     order_book=ob,
+        ...     item_locations=il,
+        ...     warehouse=w
+        ... )
+        >>> print(f"Target distance: {data.y.item()}")
+        Target distance: 42.5
     """
     # Validate inputs
     I, L, total_nodes = _validate_inputs(combined_matrix, metadata, validate_nan)
@@ -136,13 +167,32 @@ def build_graph_sparse(
         locs_list=metadata['locs']
     )
 
+    # Optional: Add simulation target
+    if simulator is not None:
+        # Validate all simulation parameters provided
+        if order_book is None or item_locations is None or warehouse is None:
+            raise ValueError(
+                "When simulator is provided, order_book, item_locations, "
+                "and warehouse must all be provided"
+            )
+
+        # Run simulation
+        total_distance, per_order = simulator(order_book, warehouse, item_locations)
+
+        # Add to Data object as graph-level target
+        data.y = torch.tensor([total_distance], dtype=torch.float)
+
     return data
 
 
 def build_graph_dense(
     combined_matrix: np.ndarray,
     metadata: dict,
-    validate_nan: bool = True
+    validate_nan: bool = True,
+    simulator: Optional[Callable] = None,
+    order_book: Optional['OrderBook'] = None,
+    item_locations: Optional['ItemLocations'] = None,
+    warehouse: Optional['Warehouse'] = None
 ) -> Data:
     """Build dense graph with edges for all non-diagonal positions.
 
@@ -154,23 +204,45 @@ def build_graph_dense(
         combined_matrix: Combined matrix from build_combined_matrix(), shape (I+L, I+L)
         metadata: Metadata dictionary with keys: n_items, n_locs, n_storage, items, locs
         validate_nan: If True, raise ValueError if any NaN values detected
+        simulator: Optional callable that takes (order_book, warehouse, item_locations)
+                   and returns (total_distance, per_order_distances).
+                   Use Simulator().simulate or Simulator().simulate_sparse_matrix
+        order_book: OrderBook for simulation (required if simulator provided)
+        item_locations: ItemLocations for simulation (required if simulator provided)
+        warehouse: Warehouse for simulation (required if simulator provided)
 
     Returns:
         torch_geometric.data.Data object with:
             - edge_index: [2, num_edges] tensor of edge indices
             - edge_attr: [num_edges, 1] tensor of edge weights (can include 0.0)
             - num_nodes: Total number of nodes (n_items + n_locs)
-            - n_items, n_locs, n_storage, items, locs: Metadata attributes
+            - n_items, n_locs, n_storage, items_list, locs_list: Metadata attributes
+            - y: [1] tensor containing total_distance (if simulator provided)
 
     Raises:
         KeyError: If required metadata key is missing
-        ValueError: If matrix shape doesn't match metadata or NaN detected
+        ValueError: If matrix shape doesn't match metadata, NaN detected,
+                    or incomplete simulation parameters
 
     Example:
+        >>> # Without simulation target
         >>> combined, metadata = build_combined_matrix(ob, il, w)
         >>> data = build_graph_dense(combined, metadata)
         >>> print(data.edge_index.shape)
         torch.Size([2, 156])
+
+        >>> # With simulation target
+        >>> from slotting_optimization.simulator import Simulator
+        >>> sim = Simulator()
+        >>> data = build_graph_dense(
+        ...     combined, metadata,
+        ...     simulator=sim.simulate,
+        ...     order_book=ob,
+        ...     item_locations=il,
+        ...     warehouse=w
+        ... )
+        >>> print(f"Target distance: {data.y.item()}")
+        Target distance: 42.5
     """
     # Validate inputs
     I, L, total_nodes = _validate_inputs(combined_matrix, metadata, validate_nan)
@@ -219,5 +291,20 @@ def build_graph_dense(
         items_list=metadata['items'],
         locs_list=metadata['locs']
     )
+
+    # Optional: Add simulation target
+    if simulator is not None:
+        # Validate all simulation parameters provided
+        if order_book is None or item_locations is None or warehouse is None:
+            raise ValueError(
+                "When simulator is provided, order_book, item_locations, "
+                "and warehouse must all be provided"
+            )
+
+        # Run simulation
+        total_distance, per_order = simulator(order_book, warehouse, item_locations)
+
+        # Add to Data object as graph-level target
+        data.y = torch.tensor([total_distance], dtype=torch.float)
 
     return data

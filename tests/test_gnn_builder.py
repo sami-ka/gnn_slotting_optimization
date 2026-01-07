@@ -66,6 +66,47 @@ def small_setup():
     return combined, metadata
 
 
+@pytest.fixture
+def full_setup():
+    """Create 2 items, 4 locs with full OrderBook, ItemLocations, Warehouse for simulation."""
+    # Same warehouse setup as small_setup
+    w = Warehouse(
+        locations=["L0", "L1", "start", "end"],
+        start_point_id="start",
+        end_point_id="end"
+    )
+
+    # Set all necessary distances
+    w.set_distance("start", "L0", 5.0)
+    w.set_distance("start", "L1", 5.0)
+    w.set_distance("start", "end", 10.0)
+    w.set_distance("L0", "L1", 1.0)
+    w.set_distance("L1", "L0", 2.0)
+    w.set_distance("L0", "end", 3.0)
+    w.set_distance("L1", "end", 3.0)
+    w.set_distance("L0", "start", 4.0)
+    w.set_distance("L1", "start", 4.0)
+    w.set_distance("end", "start", 2.0)
+    w.set_distance("end", "L0", 6.0)
+    w.set_distance("end", "L1", 6.0)
+
+    # Create orders
+    ob = OrderBook.from_orders([
+        make_order("O1", "I1", "2024-01-01T10:00:00"),
+        make_order("O1", "I2", "2024-01-01T10:01:00"),
+        make_order("O2", "I1", "2024-01-01T10:02:00"),
+    ])
+
+    # Assign items to storage locations
+    il = ItemLocations.from_records([
+        {"item_id": "I1", "location_id": "L0"},
+        {"item_id": "I2", "location_id": "L1"}
+    ])
+
+    combined, metadata = build_combined_matrix(ob, il, w)
+    return combined, metadata, ob, il, w
+
+
 # Group 1: Basic Structure Tests
 
 def test_sparse_basic_structure(small_setup):
@@ -679,3 +720,117 @@ def test_nan_error_message_includes_position():
     assert "NaN detected" in error_msg
     assert "position" in error_msg
     assert "2" in error_msg  # Should mention count of 2 NaNs
+
+
+# Group 9: Simulation Target Tests
+
+def test_sparse_with_simulator_adds_y_attribute(full_setup):
+    """Verify y attribute added when simulator provided."""
+    from slotting_optimization.simulator import Simulator
+
+    combined, metadata, ob, il, w = full_setup
+    sim = Simulator()
+
+    data = build_graph_sparse(
+        combined, metadata,
+        simulator=sim.simulate,
+        order_book=ob,
+        item_locations=il,
+        warehouse=w
+    )
+
+    assert hasattr(data, 'y'), "Data should have y attribute when simulator provided"
+    assert data.y.shape == (1,), "y should be shape [1] for graph-level target"
+    assert data.y.dtype == torch.float, "y should be float dtype"
+
+
+def test_dense_with_simulator_adds_y_attribute(full_setup):
+    """Verify y attribute added when simulator provided for dense graph."""
+    from slotting_optimization.simulator import Simulator
+
+    combined, metadata, ob, il, w = full_setup
+    sim = Simulator()
+
+    data = build_graph_dense(
+        combined, metadata,
+        simulator=sim.simulate,
+        order_book=ob,
+        item_locations=il,
+        warehouse=w
+    )
+
+    assert hasattr(data, 'y'), "Data should have y attribute when simulator provided"
+    assert data.y.shape == (1,), "y should be shape [1] for graph-level target"
+    assert data.y.dtype == torch.float, "y should be float dtype"
+
+
+def test_sparse_y_value_matches_simulation(full_setup):
+    """Verify y value equals simulation result."""
+    from slotting_optimization.simulator import Simulator
+
+    combined, metadata, ob, il, w = full_setup
+    sim = Simulator()
+
+    # Get expected value
+    expected_distance, _ = sim.simulate(ob, w, il)
+
+    # Build graph with y
+    data = build_graph_sparse(
+        combined, metadata,
+        simulator=sim.simulate,
+        order_book=ob,
+        item_locations=il,
+        warehouse=w
+    )
+
+    assert torch.isclose(data.y, torch.tensor([expected_distance])).item(), \
+        f"Expected y={expected_distance}, got {data.y.item()}"
+
+
+def test_dense_y_value_matches_simulation(full_setup):
+    """Verify y value equals simulation result for dense graph."""
+    from slotting_optimization.simulator import Simulator
+
+    combined, metadata, ob, il, w = full_setup
+    sim = Simulator()
+
+    # Get expected value
+    expected_distance, _ = sim.simulate(ob, w, il)
+
+    # Build graph with y
+    data = build_graph_dense(
+        combined, metadata,
+        simulator=sim.simulate,
+        order_book=ob,
+        item_locations=il,
+        warehouse=w
+    )
+
+    assert torch.isclose(data.y, torch.tensor([expected_distance])).item(), \
+        f"Expected y={expected_distance}, got {data.y.item()}"
+
+
+def test_sparse_without_simulator_no_y(small_setup):
+    """Verify y not added when simulator=None."""
+    combined, metadata = small_setup
+    data = build_graph_sparse(combined, metadata)
+
+    # PyG Data objects have y attribute by default, but it should be None when not provided
+    assert data.y is None, "Data.y should be None when simulator=None"
+
+
+def test_simulator_requires_all_params(full_setup):
+    """Verify error if only some simulation params provided."""
+    from slotting_optimization.simulator import Simulator
+
+    combined, metadata, ob, il, w = full_setup
+    sim = Simulator()
+
+    # Provide simulator but not all other params
+    with pytest.raises(ValueError, match="order_book, item_locations.*must all be provided"):
+        build_graph_sparse(
+            combined, metadata,
+            simulator=sim.simulate,
+            order_book=ob,
+            # Missing item_locations and warehouse
+        )
