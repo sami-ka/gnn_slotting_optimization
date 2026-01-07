@@ -117,6 +117,35 @@ end_to_all = loc_mat[n_storage + 1, :]
 
 The `_fast` variant uses vectorized Polars operations with window functions and NumPy advanced indexing for performance.
 
+**Combined Matrix for GNN** (`simulator.py`):
+The `build_combined_matrix()` function creates a single block matrix suitable for GNN input:
+
+```python
+combined_matrix, metadata = build_combined_matrix(ob, il, w)
+# Shape: (n_items + n_locs) × (n_items + n_locs)
+
+# Matrix structure:
+# [ item_loc_mat | seq_mat  ]  <- Items rows
+# [ loc_mat      | zeros    ]  <- Locations rows
+```
+
+**Start/End Handling**: Start and end locations are included in the loc_mat portion, but their columns in item_loc_mat are zeroed since items cannot be assigned to control points.
+
+**Metadata Usage**:
+```python
+# Extract specific parts using metadata
+items_block = combined_matrix[metadata['items_slice'], :]
+locs_block = combined_matrix[metadata['locs_slice'], :]
+storage_only = combined_matrix[:, metadata['storage_slice']]
+```
+
+**Extract Original Matrices**:
+```python
+submatrices = extract_submatrices(combined_matrix, metadata)
+# submatrices['item_loc_mat'], submatrices['seq_mat'],
+# submatrices['loc_mat'], submatrices['zeros']
+```
+
 **Data Generation** (`generator.py`):
 `DataGenerator.generate_samples()` creates synthetic (OrderBook, ItemLocations, Warehouse) tuples for testing and experimentation.
 

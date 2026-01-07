@@ -332,3 +332,106 @@ def build_matrices_fast(order_book: OrderBook, item_locations: ItemLocations, wa
 
     np.fill_diagonal(loc_mat, 0)
     return loc_mat, seq_mat, item_loc_mat, locs, items
+
+
+def build_combined_matrix(
+    order_book: OrderBook,
+    item_locations: ItemLocations,
+    warehouse: Warehouse,
+    use_fast: bool = True
+) -> Tuple[np.ndarray, dict]:
+    """Build a combined matrix for GNN input from all three matrices.
+
+    Creates a block matrix with structure:
+    [ item_loc_mat | seq_mat  ]  <- Items rows
+    [ loc_mat      | zeros    ]  <- Locations rows
+
+    Start and end point locations are included in loc_mat but their columns
+    in item_loc_mat are zeroed (items cannot be assigned to control points).
+
+    Args:
+        order_book: Order data
+        item_locations: Item to location assignments
+        warehouse: Warehouse with locations and distances
+        use_fast: If True, use build_matrices_fast(), else build_matrices()
+
+    Returns:
+        Tuple of (combined_matrix, metadata) where:
+        - combined_matrix: (I+L) × (I+L) numpy array
+        - metadata: Dict with keys:
+            - 'n_items': Number of items (I)
+            - 'n_locs': Number of locations (L), including start/end
+            - 'n_storage': Number of storage locations (excluding start/end)
+            - 'items_slice': slice object for item rows (0:I)
+            - 'locs_slice': slice object for location rows (I:I+L)
+            - 'storage_slice': slice object for storage location columns (0:n_storage)
+            - 'start_idx': Index of start location in locs list
+            - 'end_idx': Index of end location in locs list
+            - 'locs': List of location IDs
+            - 'items': List of item IDs
+    """
+    # Build matrices using specified function
+    if use_fast:
+        loc_mat, seq_mat, item_loc_mat, locs, items = build_matrices_fast(
+            order_book, item_locations, warehouse
+        )
+    else:
+        loc_mat, seq_mat, item_loc_mat, locs, items = build_matrices(
+            order_book, item_locations, warehouse
+        )
+
+    I = len(items)  # Number of items
+    L = len(locs)   # Number of locations (including start and end)
+    n_storage = L - 2  # Number of storage locations
+
+    # Zero out item_loc_mat columns for start and end
+    item_loc_mat_masked = item_loc_mat.copy()
+    item_loc_mat_masked[:, n_storage:] = 0  # Last 2 columns are start and end
+
+    # Build the combined matrix: [[item_loc_mat, seq_mat], [loc_mat, zeros]]
+    # Top row: concatenate item_loc_mat and seq_mat
+    top_row = np.concatenate([item_loc_mat_masked, seq_mat], axis=1)
+
+    # Bottom row: concatenate loc_mat and zeros
+    zeros_block = np.zeros((L, I), dtype=float)
+    bottom_row = np.concatenate([loc_mat, zeros_block], axis=1)
+
+    # Stack top and bottom to create final matrix
+    combined_matrix = np.concatenate([top_row, bottom_row], axis=0)
+
+    # Build metadata dictionary
+    metadata = {
+        'n_items': I,
+        'n_locs': L,
+        'n_storage': n_storage,
+        'items_slice': slice(0, I),
+        'locs_slice': slice(I, I + L),
+        'storage_slice': slice(0, n_storage),
+        'start_idx': n_storage,     # Start is at index n_storage in locs
+        'end_idx': n_storage + 1,   # End is at index n_storage + 1 in locs
+        'locs': locs,
+        'items': items
+    }
+
+    return combined_matrix, metadata
+
+
+def extract_submatrices(combined_matrix: np.ndarray, metadata: dict) -> dict:
+    """Extract the four quadrants from a combined matrix.
+
+    Args:
+        combined_matrix: Combined matrix from build_combined_matrix()
+        metadata: Metadata dict from build_combined_matrix()
+
+    Returns:
+        Dict with keys 'item_loc_mat', 'seq_mat', 'loc_mat', 'zeros'
+    """
+    I = metadata['n_items']
+    L = metadata['n_locs']
+
+    return {
+        'item_loc_mat': combined_matrix[:I, :L],
+        'seq_mat': combined_matrix[:I, L:],
+        'loc_mat': combined_matrix[I:, :L],
+        'zeros': combined_matrix[I:, L:]
+    }
