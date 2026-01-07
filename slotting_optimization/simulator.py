@@ -169,6 +169,37 @@ class Simulator:
         return total_distance, per_order
 
 
+def _reorder_locations(warehouse: Warehouse) -> Tuple[List[str], int]:
+    """Reorder warehouse locations to: [storage_locs..., start, end].
+
+    Returns:
+        Tuple of (reordered_locs, n_storage) where:
+        - reordered_locs: List of location IDs in new order
+        - n_storage: Number of storage locations (excluding start/end)
+
+    Raises:
+        ValueError: If warehouse missing start_point or end_point
+        ValueError: If start_point equals end_point
+    """
+    all_locs = warehouse.locations()
+    start = warehouse.start_point
+    end = warehouse.end_point
+
+    if start is None or end is None:
+        raise ValueError("Warehouse must define start_point and end_point")
+
+    if start == end:
+        raise ValueError("Warehouse start_point and end_point must be distinct")
+
+    # Separate storage locations from control points (maintain insertion order)
+    storage_locs = [loc for loc in all_locs if loc not in {start, end}]
+
+    # Build ordered list: storage first, then start, then end
+    reordered = storage_locs + [start, end]
+
+    return reordered, len(storage_locs)
+
+
 def build_matrices(order_book: OrderBook, item_locations: ItemLocations, warehouse: Warehouse):
     """Build three matrices from inputs:
 
@@ -178,11 +209,14 @@ def build_matrices(order_book: OrderBook, item_locations: ItemLocations, warehou
 
     The function returns a tuple (loc_mat, seq_mat, item_loc_mat, locs, items) where
     `locs` and `items` are the lists giving the row/column ordering used for the matrices.
+
+    Note: `locs` is ordered as [storage_location_0, ..., storage_location_n, start_point, end_point]
+    to facilitate matrix slicing operations where n_storage = len(locs) - 2.
     """
     df: pl.DataFrame = order_book.to_df()
 
-    # Locations (keep warehouse.locations() ordering)
-    locs = warehouse.locations()
+    # Locations (reordered: storage locations first, then start, then end)
+    locs, n_storage = _reorder_locations(warehouse)
     m = len(locs)
     loc_index = {loc: i for i, loc in enumerate(locs)}
 
@@ -221,6 +255,7 @@ def build_matrices(order_book: OrderBook, item_locations: ItemLocations, warehou
         if loc is not None and loc in loc_index:
             item_loc_mat[item_index[it], loc_index[loc]] = 1
 
+    np.fill_diagonal(loc_mat, 0)
     return loc_mat, seq_mat, item_loc_mat, locs, items
 
 
@@ -231,12 +266,13 @@ def build_matrices_fast(order_book: OrderBook, item_locations: ItemLocations, wa
     - Build `loc_mat` by filling from warehouse's distance map (no nested LxL loops)
     - Use Polars windowed `shift` to compute next-item within each order, then groupby to count unique pairs
     - Use NumPy advanced indexing to construct `item_loc_mat` efficiently
+    - Reorder locations as [storage_locs..., start, end] for easy matrix slicing
     Returns same tuple as `build_matrices`.
     """
     df: pl.DataFrame = order_book.to_df()
 
-    # Locations and index mapping
-    locs = warehouse.locations()
+    # Locations (reordered: storage locations first, then start, then end)
+    locs, n_storage = _reorder_locations(warehouse)
     m = len(locs)
     loc_index = {loc: i for i, loc in enumerate(locs)}
 

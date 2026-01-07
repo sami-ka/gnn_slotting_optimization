@@ -43,7 +43,8 @@ def test_build_matrices_basic():
 
     # Location matrix checks
     assert loc_mat.shape == (4, 4)
-    assert locs == ["start", "A", "B", "end"]
+    # Locations should be ordered: storage first, then start, then end
+    assert locs == ["A", "B", "start", "end"]
     # start -> A == 1.0
     assert np.isclose(loc_mat[locs.index("start"), locs.index("A")], 1.0)
     # A -> B is missing -> nan

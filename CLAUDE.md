@@ -103,6 +103,18 @@ Functions `build_matrices()` and `build_matrices_fast()` convert simulation data
 - `seq_mat` (I×I): Item-to-item sequence counts from orders
 - `item_loc_mat` (I×L): Binary assignment matrix (item i at location j)
 
+**Location Ordering**: The `locs` list returned by matrix functions is ordered as:
+`[storage_location_0, ..., storage_location_n, start_point, end_point]`
+
+This enables easy slicing for GNN processing:
+```python
+loc_mat, seq_mat, item_loc_mat, locs, items = build_matrices_fast(ob, il, w)
+n_storage = len(locs) - 2  # All except start and end
+storage_distances = loc_mat[:n_storage, :n_storage]
+start_to_all = loc_mat[n_storage, :]
+end_to_all = loc_mat[n_storage + 1, :]
+```
+
 The `_fast` variant uses vectorized Polars operations with window functions and NumPy advanced indexing for performance.
 
 **Data Generation** (`generator.py`):
