@@ -1,0 +1,9 @@
+- need to separate start from end to finish what has been done in marimo notebook
+- put the combination of matrices in a function
+- replace right upper part with zeros matrix (easier to optimize after)
+- use the big matrix to build the GNN 
+- simulate the distance for order preparation 
+- train the GNN
+- invert the GNN to have best values on edges for the item loc part
+- look at the distance
+- iterate
