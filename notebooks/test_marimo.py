@@ -66,7 +66,7 @@ def _():
     from slotting_optimization.warehouse import Warehouse
 
     gen = DataGenerator()
-    samples = gen.generate_samples(5, 5, 20, 2, 4, n_samples=1, distances_fixed=True, seed=5)
+    samples = gen.generate_samples(2, 2, 20, 1, 4, n_samples=1, distances_fixed=True, seed=5)
     ob, il, w = samples[0]
     # each logical order id should appear between min and max times
     df = ob.to_df()
@@ -80,7 +80,7 @@ def _(il, ob, w):
 
     loc_mat, seq_mat, item_loc_mat, locs, items = build_matrices_fast(ob, il, w)
 
-    return item_loc_mat, loc_mat, locs
+    return item_loc_mat, loc_mat, locs, seq_mat
 
 
 @app.cell
@@ -104,8 +104,8 @@ def _(item_loc_mat):
 
 
 @app.cell
-def _(item_loc_mat, loc_mat, np):
-    np.concat([loc_mat,item_loc_mat])
+def _(item_loc_mat, loc_mat, np, seq_mat):
+    np.concat([np.concat([loc_mat,item_loc_mat]), np.concat([item_loc_mat.T, seq_mat])],axis=1)
     return
 
 
