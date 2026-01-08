@@ -62,8 +62,7 @@ def small_setup():
         {"item_id": "I2", "location_id": "L1"}
     ])
 
-    combined, metadata = build_combined_matrix(ob, il, w)
-    return combined, metadata
+    return ob, il, w
 
 
 @pytest.fixture
@@ -103,16 +102,15 @@ def full_setup():
         {"item_id": "I2", "location_id": "L1"}
     ])
 
-    combined, metadata = build_combined_matrix(ob, il, w)
-    return combined, metadata, ob, il, w
+    return ob, il, w
 
 
 # Group 1: Basic Structure Tests
 
 def test_sparse_basic_structure(small_setup):
     """Verify sparse graph has correct edge_index and edge_attr shapes."""
-    combined, metadata = small_setup
-    data = build_graph_sparse(combined, metadata)
+    ob, il, w = small_setup
+    data = build_graph_sparse(ob, il, w)
 
     # Check edge_index shape and dtype
     assert data.edge_index.shape[0] == 2, "edge_index should have shape [2, num_edges]"
@@ -126,8 +124,8 @@ def test_sparse_basic_structure(small_setup):
 
 def test_dense_basic_structure(small_setup):
     """Verify dense graph has correct edge_index and edge_attr shapes."""
-    combined, metadata = small_setup
-    data = build_graph_dense(combined, metadata)
+    ob, il, w = small_setup
+    data = build_graph_dense(ob, il, w)
 
     # Check edge_index shape and dtype
     assert data.edge_index.shape[0] == 2, "edge_index should have shape [2, num_edges]"
@@ -143,10 +141,11 @@ def test_dense_basic_structure(small_setup):
 
 def test_sparse_edge_count(small_setup):
     """Verify sparse graph creates edges only for non-zero matrix values."""
-    combined, metadata = small_setup
-    data = build_graph_sparse(combined, metadata)
+    ob, il, w = small_setup
+    data = build_graph_sparse(ob, il, w)
 
-    # Calculate expected edge count
+    # Build combined matrix to calculate expected edge count
+    combined, metadata = build_combined_matrix(ob, il, w)
     I, L = metadata['n_items'], metadata['n_locs']
 
     # Count non-zeros in each quadrant (excluding diagonal)
@@ -169,11 +168,11 @@ def test_sparse_edge_count(small_setup):
 
 def test_dense_edge_count(small_setup):
     """Verify dense graph creates edges for all positions (except diagonal and bottom-right)."""
-    combined, metadata = small_setup
-    data = build_graph_dense(combined, metadata)
+    ob, il, w = small_setup
+    data = build_graph_dense(ob, il, w)
 
-    # Calculate expected edge count
-    I, L = metadata['n_items'], metadata['n_locs']
+    # Get dimensions from Data object
+    I, L = data.n_items, data.n_locs
     total_nodes = I + L
 
     # Total possible edges
@@ -192,10 +191,10 @@ def test_dense_edge_count(small_setup):
 
 def test_sparse_vs_dense_edge_count_difference(small_setup):
     """Verify sparse has fewer edges than dense when matrix has zeros."""
-    combined, metadata = small_setup
+    ob, il, w = small_setup
 
-    sparse_data = build_graph_sparse(combined, metadata)
-    dense_data = build_graph_dense(combined, metadata)
+    sparse_data = build_graph_sparse(ob, il, w)
+    dense_data = build_graph_dense(ob, il, w)
 
     sparse_edges = sparse_data.edge_index.shape[1]
     dense_edges = dense_data.edge_index.shape[1]
@@ -207,19 +206,19 @@ def test_sparse_vs_dense_edge_count_difference(small_setup):
 # Group 3: NaN Validation Tests
 
 def test_sparse_nan_validation_triggers():
-    """Verify NaN in matrix raises ValueError with correct message."""
-    # Create simple setup with all distances defined first
+    """Verify NaN from missing warehouse distance raises ValueError."""
+    # Create warehouse with MISSING distance (will produce NaN in loc_mat)
     w = Warehouse(
         locations=["L0", "start", "end"],
         start_point_id="start",
         end_point_id="end"
     )
-    # Define all distances to avoid NaN
+    # Define most distances but intentionally skip one to create NaN
     w.set_distance("start", "L0", 5.0)
     w.set_distance("start", "end", 10.0)
     w.set_distance("L0", "end", 3.0)
     w.set_distance("L0", "start", 4.0)
-    w.set_distance("end", "start", 2.0)
+    # MISSING: w.set_distance("end", "start", 2.0) - will produce NaN!
     w.set_distance("end", "L0", 6.0)
 
     ob = OrderBook.from_orders([
@@ -230,28 +229,24 @@ def test_sparse_nan_validation_triggers():
         {"item_id": "I1", "location_id": "L0"}
     ])
 
-    combined, metadata = build_combined_matrix(ob, il, w)
-
-    # Inject NaN at known position
-    combined[1, 2] = np.nan
-
-    with pytest.raises(ValueError, match=r"NaN detected.*\[1, 2\]"):
-        build_graph_sparse(combined, metadata)
+    # Should raise ValueError during internal matrix building
+    with pytest.raises(ValueError, match="NaN detected"):
+        build_graph_sparse(ob, il, w)
 
 
 def test_dense_nan_validation_triggers():
-    """Verify NaN in matrix raises ValueError with correct message."""
-    # Create simple setup with all distances defined first
+    """Verify NaN from missing warehouse distance raises ValueError."""
+    # Create warehouse with MISSING distance (will produce NaN in loc_mat)
     w = Warehouse(
         locations=["L0", "start", "end"],
         start_point_id="start",
         end_point_id="end"
     )
-    # Define all distances to avoid NaN
+    # Define most distances but intentionally skip one to create NaN
     w.set_distance("start", "L0", 5.0)
     w.set_distance("start", "end", 10.0)
     w.set_distance("L0", "end", 3.0)
-    w.set_distance("L0", "start", 4.0)
+    # MISSING: w.set_distance("L0", "start", 4.0) - will produce NaN!
     w.set_distance("end", "start", 2.0)
     w.set_distance("end", "L0", 6.0)
 
@@ -263,25 +258,38 @@ def test_dense_nan_validation_triggers():
         {"item_id": "I1", "location_id": "L0"}
     ])
 
-    combined, metadata = build_combined_matrix(ob, il, w)
-
-    # Inject NaN at known position
-    combined[0, 1] = np.nan
-
-    with pytest.raises(ValueError, match=r"NaN detected.*\[0, 1\]"):
-        build_graph_dense(combined, metadata)
+    # Should raise ValueError during internal matrix building
+    with pytest.raises(ValueError, match="NaN detected"):
+        build_graph_dense(ob, il, w)
 
 
-def test_nan_validation_can_be_disabled(small_setup):
+def test_nan_validation_can_be_disabled():
     """Verify validate_nan=False skips NaN check."""
-    combined, metadata = small_setup
+    # Create warehouse with MISSING distance (will produce NaN)
+    w = Warehouse(
+        locations=["L0", "start", "end"],
+        start_point_id="start",
+        end_point_id="end"
+    )
+    # Define most distances but intentionally skip one
+    w.set_distance("start", "L0", 5.0)
+    w.set_distance("start", "end", 10.0)
+    w.set_distance("L0", "end", 3.0)
+    w.set_distance("L0", "start", 4.0)
+    # MISSING: w.set_distance("end", "start", 2.0) - will produce NaN!
+    w.set_distance("end", "L0", 6.0)
 
-    # Inject NaN
-    combined[0, 0] = np.nan
+    ob = OrderBook.from_orders([
+        make_order("O1", "I1", "2024-01-01T10:00:00")
+    ])
+
+    il = ItemLocations.from_records([
+        {"item_id": "I1", "location_id": "L0"}
+    ])
 
     # Should not raise with validate_nan=False
     # (may produce invalid graph, but that's user's choice)
-    data = build_graph_sparse(combined, metadata, validate_nan=False)
+    data = build_graph_sparse(ob, il, w, validate_nan=False)
     assert data is not None
 
 
@@ -289,8 +297,8 @@ def test_nan_validation_can_be_disabled(small_setup):
 
 def test_sparse_no_self_loops(small_setup):
     """Verify diagonal elements are excluded (no i==j edges)."""
-    combined, metadata = small_setup
-    data = build_graph_sparse(combined, metadata)
+    ob, il, w = small_setup
+    data = build_graph_sparse(ob, il, w)
 
     # Check no self-loops
     edges = data.edge_index.numpy()
@@ -303,8 +311,8 @@ def test_sparse_no_self_loops(small_setup):
 
 def test_dense_no_self_loops(small_setup):
     """Verify diagonal elements are excluded (no i==j edges)."""
-    combined, metadata = small_setup
-    data = build_graph_dense(combined, metadata)
+    ob, il, w = small_setup
+    data = build_graph_dense(ob, il, w)
 
     # Check no self-loops
     edges = data.edge_index.numpy()
@@ -317,58 +325,11 @@ def test_dense_no_self_loops(small_setup):
 
 def test_sparse_bottom_right_quadrant_skipped(small_setup):
     """Verify bottom-right (L×I) zeros block creates no edges in sparse."""
-    combined, metadata = small_setup
-    data = build_graph_sparse(combined, metadata)
-
-    I, L = metadata['n_items'], metadata['n_locs']
-
-    # Check for edges from location nodes to item nodes
-    edges = data.edge_index.numpy()
-    sources = edges[0]
-    targets = edges[1]
-
-    # Bottom-right quadrant: source >= I (location nodes), target >= I (should go to items I to I+L-1)
-    # Actually target should be < I for this quadrant
-    bottom_right_edges = (sources >= I) & (targets >= I)
-
-    # Count such edges - they should exist (loc-to-loc)
-    # But edges from locs (>=I) to items (<I) should not exist in bottom-right region
-    # Wait, I need to reconsider. Bottom-right is rows I:, cols I: which is loc rows, item cols (I:I+I)
-
-    # Let me reconsider the structure:
-    # combined is (I+L, I+L)
-    # Top-left (I×L): rows 0:I, cols 0:L - item_loc_mat
-    # Top-right (I×I): rows 0:I, cols L:I+L - seq_mat
-    # Bottom-left (L×L): rows I:I+L, cols 0:L - loc_mat
-    # Bottom-right (L×I): rows I:I+L, cols L:I+L - zeros
-
-    # Wait, this doesn't make sense. Let me recalculate.
-    # Matrix is (I+L, I+L)
-    # First I rows are items, next L rows are locations
-    # First L cols are locations, next I cols are items
-
-    # Actually from the plan:
-    # Top-left (I×L): item_loc_mat - items to locations
-    # Top-right (I×I): seq_mat - items to items
-    # Bottom-left (L×L): loc_mat - locations to locations
-    # Bottom-right (L×I): zeros - locations to items
-
-    # So bottom-right: rows I:I+L (locations), cols L:L+I (items)
-    # In node indexing: nodes 0:I are items, nodes I:I+L are locations
-    # So edges from location nodes (>=I) to item nodes (<I) should not exist
-
-    # Bottom-right quadrant in matrix coords: rows >= I, cols >= L
-    # In node coords: sources >= I (location nodes), targets = cols - L + I for cols >= L
-    # Actually, cols >= L corresponds to node indices: if col >= L, then node = col - L (since first L cols are locs, next I cols are items starting at node 0)
-
-    # This is getting complex. Let me just check that we don't have edges that shouldn't exist.
-    # The bottom-right quadrant is all zeros, so sparse should not create any edges from it
-    # But I can't easily identify which edges come from bottom-right without reconstructing the logic
-
-    # Let me instead verify that zero-valued positions don't create edges
-    # This is already tested by edge count test
+    ob, il, w = small_setup
+    data = build_graph_sparse(ob, il, w)
 
     # For this test, I'll verify that all edges in sparse have non-zero values
+    # (since bottom-right quadrant is all zeros, sparse should skip it)
     edges_np = data.edge_index.numpy()
     attrs_np = data.edge_attr.numpy()
 
@@ -378,63 +339,12 @@ def test_sparse_bottom_right_quadrant_skipped(small_setup):
 
 def test_dense_bottom_right_quadrant_skipped(small_setup):
     """Verify bottom-right (L×I) zeros block creates no edges even in dense."""
-    combined, metadata = small_setup
-    data = build_graph_dense(combined, metadata)
+    ob, il, w = small_setup
+    data = build_graph_dense(ob, il, w)
 
-    I, L = metadata['n_items'], metadata['n_locs']
-
-    # Bottom-right quadrant: location nodes to item nodes
-    # In matrix coords: rows >= I, cols >= L
-    # Matrix structure: rows 0:I are items, rows I: are locations
-    #                   cols 0:L are locations, cols L: are items
-
-    # In node indexing: nodes 0:I-1 are items, nodes I:I+L-1 are locations
-
-    # Bottom-right: matrix[I:, L:]
-    # This maps to: source nodes I to I+L-1, target nodes 0 to I-1
-    # Wait, that's not right either.
-
-    # Let me think more carefully:
-    # Matrix (I+L, I+L) is indexed by [row, col]
-    # row index = node index (0:I are items, I:I+L are locations)
-    # col index also = node index
-    # So matrix[i, j] = edge from node i to node j
-
-    # Top-left: matrix[0:I, 0:L] - but wait, this doesn't work
-    # Let me look at the build_combined_matrix code again
-
-    # From simulator.py line 391-400:
-    # top_row = concat([item_loc_mat, seq_mat], axis=1)  # (I, L+I)
-    # bottom_row = concat([loc_mat, zeros], axis=1)      # (L, L+I)
-    # combined = concat([top_row, bottom_row], axis=0)   # (I+L, L+I)
-
-    # Wait, L+I = total columns, and I+L rows
-    # So matrix is (I+L, L+I) NOT (I+L, I+L)
-
-    # Let me re-read the code... No, it should be (I+L, I+L)
-
-    # item_loc_mat: I×L (items to locations)
-    # seq_mat: I×I (items to items)
-    # top_row: concat horizontally = (I, L+I)
-
-    # loc_mat: L×L (locations to locations)
-    # zeros: L×I (locations to items)
-    # bottom_row: concat horizontally = (L, L+I)
-
-    # combined: concat vertically = (I+L, L+I)
-
-    # Oh! So the matrix is (I+L, L+I), not square!
-
-    # Wait, that can't be right for a graph adjacency matrix. Let me check again.
-
-    # From the plan: "Matrix shape: (I+L) × (I+L)"
-    # From the test in test_combined_matrix.py, let me check...
-
-    # Actually, I should just verify the test from the plan works:
-    # Check that we have the expected number of edges
-
-    # For now, let me just check that the edge count is correct (already tested above)
-    # and move on
+    # The edge count test already verifies this - dense skips the bottom-right quadrant
+    # which is subtracted from the total possible edges
+    # This test is a placeholder for future verification if needed
     pass
 
 
@@ -442,13 +352,13 @@ def test_dense_bottom_right_quadrant_skipped(small_setup):
 
 def test_sparse_preserves_asymmetry(small_setup):
     """Verify directed edges preserve asymmetry (A->B != B->A)."""
-    combined, metadata = small_setup
-    data = build_graph_sparse(combined, metadata)
+    ob, il, w = small_setup
+    data = build_graph_sparse(ob, il, w)
 
     # We set L0->L1 = 1.0 and L1->L0 = 2.0 in the fixture
     # Find indices of L0 and L1 in node indexing
-    I = metadata['n_items']
-    locs = metadata['locs']
+    I = data.n_items
+    locs = data.locs_list
 
     l0_idx = locs.index("L0")
     l1_idx = locs.index("L1")
@@ -480,12 +390,12 @@ def test_sparse_preserves_asymmetry(small_setup):
 
 def test_dense_preserves_asymmetry(small_setup):
     """Verify directed edges preserve asymmetry in dense mode."""
-    combined, metadata = small_setup
-    data = build_graph_dense(combined, metadata)
+    ob, il, w = small_setup
+    data = build_graph_dense(ob, il, w)
 
     # Same test as sparse
-    I = metadata['n_items']
-    locs = metadata['locs']
+    I = data.n_items
+    locs = data.locs_list
 
     l0_idx = locs.index("L0")
     l1_idx = locs.index("L1")
@@ -513,9 +423,11 @@ def test_dense_preserves_asymmetry(small_setup):
 
 def test_sparse_edge_values_correct(small_setup):
     """Verify edge_attr values match non-zero matrix positions."""
-    combined, metadata = small_setup
-    data = build_graph_sparse(combined, metadata)
+    ob, il, w = small_setup
+    data = build_graph_sparse(ob, il, w)
 
+    # Build combined matrix to verify values
+    combined, metadata = build_combined_matrix(ob, il, w)
     I, L = metadata['n_items'], metadata['n_locs']
 
     # For each edge, verify the attribute matches the matrix value
@@ -545,9 +457,11 @@ def test_sparse_edge_values_correct(small_setup):
 
 def test_dense_edge_values_correct(small_setup):
     """Verify edge_attr values match matrix positions (including 0s)."""
-    combined, metadata = small_setup
-    data = build_graph_dense(combined, metadata)
+    ob, il, w = small_setup
+    data = build_graph_dense(ob, il, w)
 
+    # Build combined matrix to verify values
+    combined, metadata = build_combined_matrix(ob, il, w)
     I, L = metadata['n_items'], metadata['n_locs']
 
     # For each edge, verify the attribute matches the matrix value
@@ -573,18 +487,16 @@ def test_dense_edge_values_correct(small_setup):
 
 def test_dense_can_have_zero_edge_weights(small_setup):
     """Verify dense mode includes edges with weight 0.0."""
-    combined, metadata = small_setup
-    data = build_graph_dense(combined, metadata)
+    ob, il, w = small_setup
+    data = build_graph_dense(ob, il, w)
 
     attrs = data.edge_attr.numpy()
 
     # Check if there are any zero-valued edges
     zero_edges = (attrs == 0.0).any()
 
-    # There should be some zero-valued edges in dense mode
-    # (unless the matrix has no zeros in valid positions, which is unlikely)
-    # Let me check the matrix to see if there are zeros
-
+    # Build combined matrix to check if there are zeros in valid regions
+    combined, metadata = build_combined_matrix(ob, il, w)
     I, L = metadata['n_items'], metadata['n_locs']
 
     # Check for zeros in valid regions (not diagonal, not bottom-right)
@@ -616,8 +528,11 @@ def test_dense_can_have_zero_edge_weights(small_setup):
 
 def test_sparse_metadata_included(small_setup):
     """Verify Data object contains n_items, n_locs, items_list, locs_list attributes."""
-    combined, metadata = small_setup
-    data = build_graph_sparse(combined, metadata)
+    ob, il, w = small_setup
+    data = build_graph_sparse(ob, il, w)
+
+    # Build combined matrix to get expected metadata values
+    combined, metadata = build_combined_matrix(ob, il, w)
 
     assert hasattr(data, 'n_items'), "Data should have n_items attribute"
     assert hasattr(data, 'n_locs'), "Data should have n_locs attribute"
@@ -634,8 +549,11 @@ def test_sparse_metadata_included(small_setup):
 
 def test_dense_metadata_included(small_setup):
     """Verify Data object contains metadata attributes."""
-    combined, metadata = small_setup
-    data = build_graph_dense(combined, metadata)
+    ob, il, w = small_setup
+    data = build_graph_dense(ob, il, w)
+
+    # Build combined matrix to get expected metadata values
+    combined, metadata = build_combined_matrix(ob, il, w)
 
     assert hasattr(data, 'n_items'), "Data should have n_items attribute"
     assert hasattr(data, 'n_locs'), "Data should have n_locs attribute"
@@ -649,10 +567,10 @@ def test_dense_metadata_included(small_setup):
 
 def test_num_nodes_attribute(small_setup):
     """Verify num_nodes = n_items + n_locs."""
-    combined, metadata = small_setup
-    data = build_graph_sparse(combined, metadata)
+    ob, il, w = small_setup
+    data = build_graph_sparse(ob, il, w)
 
-    expected_num_nodes = metadata['n_items'] + metadata['n_locs']
+    expected_num_nodes = data.n_items + data.n_locs
 
     assert hasattr(data, 'num_nodes'), "Data should have num_nodes attribute"
     assert data.num_nodes == expected_num_nodes
@@ -661,16 +579,20 @@ def test_num_nodes_attribute(small_setup):
 # Group 8: Error Handling Tests
 
 def test_missing_metadata_key_raises():
-    """Verify missing metadata keys raise KeyError."""
+    """Verify missing metadata keys raise KeyError in internal validation."""
+    from slotting_optimization.gnn_builder import _validate_inputs
+
     combined = np.zeros((5, 5))
     metadata = {'n_items': 2}  # Missing required keys
 
     with pytest.raises(KeyError, match="metadata missing required key"):
-        build_graph_sparse(combined, metadata)
+        _validate_inputs(combined, metadata, validate_nan=True)
 
 
 def test_shape_mismatch_raises():
-    """Verify mismatched matrix shape raises ValueError."""
+    """Verify mismatched matrix shape raises ValueError in internal validation."""
+    from slotting_optimization.gnn_builder import _validate_inputs
+
     combined = np.zeros((5, 6))  # Non-square matrix
     metadata = {
         'n_items': 2,
@@ -681,40 +603,28 @@ def test_shape_mismatch_raises():
     }
 
     with pytest.raises(ValueError, match="shape.*doesn't match"):
-        build_graph_sparse(combined, metadata)
+        _validate_inputs(combined, metadata, validate_nan=True)
 
 
 def test_nan_error_message_includes_position():
-    """Verify NaN error message shows position and count."""
-    w = Warehouse(
-        locations=["L0", "start", "end"],
-        start_point_id="start",
-        end_point_id="end"
-    )
-    # Define all distances to avoid NaN
-    w.set_distance("start", "L0", 5.0)
-    w.set_distance("start", "end", 10.0)
-    w.set_distance("L0", "end", 3.0)
-    w.set_distance("L0", "start", 4.0)
-    w.set_distance("end", "start", 2.0)
-    w.set_distance("end", "L0", 6.0)
+    """Verify NaN error message shows position and count in internal validation."""
+    from slotting_optimization.gnn_builder import _validate_inputs
 
-    ob = OrderBook.from_orders([
-        make_order("O1", "I1", "2024-01-01T10:00:00")
-    ])
-
-    il = ItemLocations.from_records([
-        {"item_id": "I1", "location_id": "L0"}
-    ])
-
-    combined, metadata = build_combined_matrix(ob, il, w)
-
-    # Inject multiple NaNs
+    # Create a matrix with multiple NaNs
+    combined = np.zeros((4, 4))
     combined[0, 1] = np.nan
     combined[2, 3] = np.nan
 
+    metadata = {
+        'n_items': 2,
+        'n_locs': 2,
+        'n_storage': 1,
+        'items': ['I1', 'I2'],
+        'locs': ['L0', 'start']
+    }
+
     with pytest.raises(ValueError) as exc_info:
-        build_graph_sparse(combined, metadata)
+        _validate_inputs(combined, metadata, validate_nan=True)
 
     error_msg = str(exc_info.value)
     assert "NaN detected" in error_msg
@@ -728,15 +638,12 @@ def test_sparse_with_simulator_adds_y_attribute(full_setup):
     """Verify y attribute added when simulator provided."""
     from slotting_optimization.simulator import Simulator
 
-    combined, metadata, ob, il, w = full_setup
+    ob, il, w = full_setup
     sim = Simulator()
 
     data = build_graph_sparse(
-        combined, metadata,
-        simulator=sim.simulate,
-        order_book=ob,
-        item_locations=il,
-        warehouse=w
+        ob, il, w,
+        simulator=sim.simulate
     )
 
     assert hasattr(data, 'y'), "Data should have y attribute when simulator provided"
@@ -748,15 +655,12 @@ def test_dense_with_simulator_adds_y_attribute(full_setup):
     """Verify y attribute added when simulator provided for dense graph."""
     from slotting_optimization.simulator import Simulator
 
-    combined, metadata, ob, il, w = full_setup
+    ob, il, w = full_setup
     sim = Simulator()
 
     data = build_graph_dense(
-        combined, metadata,
-        simulator=sim.simulate,
-        order_book=ob,
-        item_locations=il,
-        warehouse=w
+        ob, il, w,
+        simulator=sim.simulate
     )
 
     assert hasattr(data, 'y'), "Data should have y attribute when simulator provided"
@@ -768,7 +672,7 @@ def test_sparse_y_value_matches_simulation(full_setup):
     """Verify y value equals simulation result."""
     from slotting_optimization.simulator import Simulator
 
-    combined, metadata, ob, il, w = full_setup
+    ob, il, w = full_setup
     sim = Simulator()
 
     # Get expected value
@@ -776,11 +680,8 @@ def test_sparse_y_value_matches_simulation(full_setup):
 
     # Build graph with y
     data = build_graph_sparse(
-        combined, metadata,
-        simulator=sim.simulate,
-        order_book=ob,
-        item_locations=il,
-        warehouse=w
+        ob, il, w,
+        simulator=sim.simulate
     )
 
     assert torch.isclose(data.y, torch.tensor([expected_distance])).item(), \
@@ -791,7 +692,7 @@ def test_dense_y_value_matches_simulation(full_setup):
     """Verify y value equals simulation result for dense graph."""
     from slotting_optimization.simulator import Simulator
 
-    combined, metadata, ob, il, w = full_setup
+    ob, il, w = full_setup
     sim = Simulator()
 
     # Get expected value
@@ -799,11 +700,8 @@ def test_dense_y_value_matches_simulation(full_setup):
 
     # Build graph with y
     data = build_graph_dense(
-        combined, metadata,
-        simulator=sim.simulate,
-        order_book=ob,
-        item_locations=il,
-        warehouse=w
+        ob, il, w,
+        simulator=sim.simulate
     )
 
     assert torch.isclose(data.y, torch.tensor([expected_distance])).item(), \
@@ -812,25 +710,25 @@ def test_dense_y_value_matches_simulation(full_setup):
 
 def test_sparse_without_simulator_no_y(small_setup):
     """Verify y not added when simulator=None."""
-    combined, metadata = small_setup
-    data = build_graph_sparse(combined, metadata)
+    ob, il, w = small_setup
+    data = build_graph_sparse(ob, il, w)
 
     # PyG Data objects have y attribute by default, but it should be None when not provided
     assert data.y is None, "Data.y should be None when simulator=None"
 
 
-def test_simulator_requires_all_params(full_setup):
-    """Verify error if only some simulation params provided."""
+def test_simulator_parameter_is_optional(full_setup):
+    """Verify simulator parameter is optional (test new API)."""
+    # With the new API, ob/il/w are required but simulator is optional
+    # This test verifies the new simplified API works correctly
+    ob, il, w = full_setup
+
+    # Should work without simulator
+    data_no_sim = build_graph_sparse(ob, il, w)
+    assert data_no_sim.y is None, "No simulator should mean no y attribute"
+
+    # Should work with simulator
     from slotting_optimization.simulator import Simulator
-
-    combined, metadata, ob, il, w = full_setup
     sim = Simulator()
-
-    # Provide simulator but not all other params
-    with pytest.raises(ValueError, match="order_book, item_locations.*must all be provided"):
-        build_graph_sparse(
-            combined, metadata,
-            simulator=sim.simulate,
-            order_book=ob,
-            # Missing item_locations and warehouse
-        )
+    data_with_sim = build_graph_sparse(ob, il, w, simulator=sim.simulate)
+    assert data_with_sim.y is not None, "Simulator should add y attribute"
