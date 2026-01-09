@@ -1,5 +1,6 @@
-- build a GNN
-- train the GNN
+- Look at larger samples but not too much
+- think about ways to generate not completely random orderbook
+- look at what part of sample generating takes time
 - invert the GNN to have best values on edges for the item loc part
 - look at the distance of best solution from invert optimization
 - iterate
