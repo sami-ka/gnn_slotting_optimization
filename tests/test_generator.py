@@ -247,3 +247,101 @@ def test_nb_items_integration_with_build_matrices():
     assert item_loc_mat.shape[1] == 14
     # Each item should be assigned to exactly one location
     assert all(item_loc_mat.sum(axis=1) == 1)
+
+
+# Optimized Generator Tests
+
+def test_generate_samples_optimized_correctness():
+    """Test that optimized generator produces same results with same seed"""
+    gen = DataGenerator()
+
+    # Generate with same seed
+    samples_a = gen.generate_samples(
+        n_locations=50, nb_items=30, n_orders=100,
+        min_items_per_order=1, max_items_per_order=3,
+        n_samples=5, distances_fixed=True, seed=42
+    )
+
+    samples_b = gen.generate_samples(
+        n_locations=50, nb_items=30, n_orders=100,
+        min_items_per_order=1, max_items_per_order=3,
+        n_samples=5, distances_fixed=True, seed=42
+    )
+
+    # Verify identical results
+    for (ob_a, il_a, w_a), (ob_b, il_b, w_b) in zip(samples_a, samples_b):
+        # Compare OrderBooks
+        df_a = ob_a.to_df().sort(["order_id", "item_id", "timestamp"])
+        df_b = ob_b.to_df().sort(["order_id", "item_id", "timestamp"])
+        assert df_a.equals(df_b)
+
+        # Compare ItemLocations
+        assert il_a.to_dict() == il_b.to_dict()
+
+        # Compare Warehouses
+        assert w_a._distance_map == w_b._distance_map
+
+
+def test_generate_samples_warehouse_reuse():
+    """Test that distances_fixed=True reuses warehouse efficiently"""
+    gen = DataGenerator()
+
+    samples = gen.generate_samples(
+        n_locations=100, nb_items=50, n_orders=50,
+        min_items_per_order=1, max_items_per_order=2,
+        n_samples=10, distances_fixed=True, seed=123
+    )
+
+    # Extract all warehouses
+    warehouses = [w for _, _, w in samples]
+
+    # All warehouses should share same distance_map (Python object identity)
+    first_dist_map = warehouses[0]._distance_map
+    for w in warehouses[1:]:
+        # They should be the same object reference (not just equal)
+        assert w._distance_map is first_dist_map, "Warehouses should share distance_map"
+
+
+def test_generate_samples_orderbook_uses_datetime():
+    """Test that generated OrderBook has proper datetime types"""
+    from datetime import datetime
+
+    gen = DataGenerator()
+    samples = gen.generate_samples(
+        n_locations=10, nb_items=10, n_orders=20,
+        min_items_per_order=1, max_items_per_order=3,
+        n_samples=1, distances_fixed=True, seed=42
+    )
+
+    ob, _, _ = samples[0]
+    df = ob.to_df()
+
+    # Timestamp column should be Datetime type
+    import polars as pl
+    assert df.schema["timestamp"] == pl.Datetime
+
+    # All timestamps should be datetime objects
+    timestamps = df["timestamp"].to_list()
+    assert all(isinstance(ts, datetime) for ts in timestamps)
+
+
+def test_generate_samples_warehouse_distances_all_set():
+    """Test that generated warehouse has all necessary distances set"""
+    gen = DataGenerator()
+    samples = gen.generate_samples(
+        n_locations=5, nb_items=5, n_orders=10,
+        min_items_per_order=1, max_items_per_order=2,
+        n_samples=1, distances_fixed=True, seed=42
+    )
+
+    _, _, w = samples[0]
+
+    # Should have distances for full directed graph (excluding self-loops)
+    # 5 locations + start + end = 7 nodes
+    # Full directed graph: 7 * (7-1) = 42 edges
+    expected_edges = 7 * (7 - 1)
+    assert len(w._distance_map) == expected_edges
+
+    # Verify some specific distances exist
+    assert w.get_distance("start", "L0") is not None
+    assert w.get_distance("L0", "end") is not None

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 from datetime import datetime
 
 import polars as pl
@@ -38,6 +38,32 @@ class OrderBook:
         df = pl.from_dicts(records)
         # Parse ISO datetimes
         df = df.with_columns(pl.col("timestamp").str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S", strict=False))
+        return cls(df)
+
+    @classmethod
+    def from_dicts_direct(cls, records: List[Dict[str, Any]]) -> "OrderBook":
+        """Create OrderBook directly from dict records with datetime objects.
+
+        More efficient than from_orders() when you have datetime objects,
+        as it avoids string conversion overhead.
+
+        Args:
+            records: List of dicts with keys: order_id (str), item_id (str),
+                     timestamp (datetime)
+
+        Returns:
+            OrderBook instance
+        """
+        if not records:
+            return cls()
+
+        df = pl.from_dicts(records)
+        df = df.with_columns([
+            pl.col("order_id").cast(pl.Utf8),
+            pl.col("item_id").cast(pl.Utf8),
+            pl.col("timestamp").cast(pl.Datetime),
+        ])
+
         return cls(df)
 
     def add(self, order: Order) -> None:

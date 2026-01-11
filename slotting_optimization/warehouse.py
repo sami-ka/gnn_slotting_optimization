@@ -55,5 +55,29 @@ class Warehouse:
     def get_distance(self, from_id: str, to_id: str) -> Optional[float]:
         return self._distance_map.get((from_id, to_id))
 
+    def set_distances_bulk(self, distance_map: Dict[Tuple[str, str], float]) -> None:
+        """Efficiently set multiple distances at once.
+
+        Significantly faster than calling set_distance() in a loop for large
+        distance maps, as it performs bulk location validation.
+
+        Args:
+            distance_map: Dictionary mapping (from_id, to_id) tuples to distances
+        """
+        # Extract all unique location IDs from distance map
+        unique_locs = set()
+        for (from_id, to_id) in distance_map.keys():
+            unique_locs.add(from_id)
+            unique_locs.add(to_id)
+
+        # Add new locations (deterministic ordering with sorted)
+        current_locs = set(self._locations)
+        new_locs = sorted(unique_locs - current_locs)
+        self._locations.extend(new_locs)
+
+        # Bulk update distance map
+        for (from_id, to_id), distance in distance_map.items():
+            self._distance_map[(from_id, to_id)] = float(distance)
+
     def __repr__(self) -> str:
         return f"Warehouse(n_locations={len(self._locations)}, start={self._start_point_id})"

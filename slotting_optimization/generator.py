@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List, Tuple
 import random
 import time
+from datetime import datetime
 
 import polars as pl
 
@@ -62,42 +63,52 @@ class DataGenerator:
         # Randomly select which locations get items (always use random sampling)
         selected_locations = rng.sample(locations, nb_items)
 
-        # If distances_fixed, create a base distance mapping once
-        base_distance_map = None
+        # If distances_fixed, create base warehouse once with all distances set
+        base_warehouse = None
         if distances_fixed:
             base_distance_map = self._make_distance_map(locations, rng)
+            # Create warehouse once with bulk distance setting
+            base_warehouse = Warehouse(
+                locations=["start", "end"] + locations,
+                start_point_id="start",
+                end_point_id="end"
+            )
+            base_warehouse.set_distances_bulk(base_distance_map)
 
         samples: List[Tuple[OrderBook, ItemLocations, Warehouse]] = []
 
         for sidx in range(n_samples):
-            # For reproducibility when distances not fixed, derive a per-sample RNG
-            if distances_fixed:
-                dist_map = base_distance_map
-            else:
-                # Use rng to derive an int seed for this sample deterministically
-                sample_seed = rng.randint(0, 2**30 - 1)
-                sample_rng = random.Random(sample_seed)
-                dist_map = self._make_distance_map(locations, sample_rng)
-
             # Build ItemLocations
             il = ItemLocations.from_records([{"item_id": sku, "location_id": loc} for sku, loc in zip(skus, selected_locations)])
 
-            # Build Warehouse and set distances
-            w = Warehouse(locations=["start", "end"] + locations, start_point_id="start", end_point_id="end")
-            for (a, b), d in dist_map.items():
-                w.set_distance(a, b, d)
+            # Reuse warehouse when distances fixed
+            if distances_fixed:
+                w = base_warehouse  # Share reference - read-only after creation
+            else:
+                # Create new warehouse for variable distances case
+                sample_seed = rng.randint(0, 2**30 - 1)
+                sample_rng = random.Random(sample_seed)
+                dist_map = self._make_distance_map(locations, sample_rng)
+                w = Warehouse(locations=["start", "end"] + locations,
+                             start_point_id="start", end_point_id="end")
+                w.set_distances_bulk(dist_map)  # Use bulk method
 
             # Generate orders (logical orders). Each logical order gets k items (between min and max)
-            orders: List[Order] = []
+            # Create order dicts directly with datetime objects - no intermediate Order objects
+            order_dicts = []
             base_ts = int(time.time()) + sidx * 1000000  # offset per sample to avoid collisions
             for oid in range(n_orders):
                 k = rng.randint(min_items_per_order, max_items_per_order)
                 for item_idx in range(k):
                     sku = rng.choice(skus)
-                    ts = base_ts + oid * 60 + item_idx  # ensure increasing-ish timestamps
-                    orders.append(Order.from_dict({"order_id": f"o{oid}", "item_id": sku, "timestamp": ts}))
+                    epoch_ts = base_ts + oid * 60 + item_idx  # ensure increasing-ish timestamps
+                    order_dicts.append({
+                        "order_id": f"o{oid}",
+                        "item_id": sku,
+                        "timestamp": datetime.fromtimestamp(epoch_ts)
+                    })
 
-            ob = OrderBook.from_orders(orders)
+            ob = OrderBook.from_dicts_direct(order_dicts)
             samples.append((ob, il, w))
 
         return samples
