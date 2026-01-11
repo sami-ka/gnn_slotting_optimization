@@ -28,7 +28,7 @@ def _():
     from slotting_optimization.warehouse import Warehouse
 
     gen = DataGenerator()
-    samples = gen.generate_samples(200, 200, 1000, 1, 10, n_samples=1000, distances_fixed=True, seed=5)
+    samples = gen.generate_samples(20, 20, 300, 1, 10, n_samples=1000, distances_fixed=True, seed=5)
     return (samples,)
 
 
@@ -52,30 +52,6 @@ def _(samples):
 @app.cell
 def _(list_data):
     len(list_data)
-    return
-
-
-@app.cell
-def _(list_data):
-    from torch_geometric.data import InMemoryDataset
-    class CustomDataset(InMemoryDataset):
-        def __init__(self, listOfDataObjects):
-            super().__init__()
-            self.data, self.slices = self.collate(listOfDataObjects)
-
-        def __len__(self):
-            return len(self.slices)
-
-        def __getitem__(self, idx):
-            sample = self.get(idx)
-            return sample
-    dataset = CustomDataset(list_data)
-    return (dataset,)
-
-
-@app.cell
-def _(dataset):
-    dataset.collate
     return
 
 
@@ -253,7 +229,7 @@ def _(model, test_loader, torch, train_loader):
             correct += ((pred - data.y) ** 2).sum().item()
         return correct / len(loader.dataset)  # MSE
 
-    for epoch in range(1, 10):
+    for epoch in range(1, 100):
         train()
         train_mse = test(train_loader)
         test_mse = test(test_loader)
