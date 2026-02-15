@@ -1,4 +1,4 @@
-- Look at larger samples but not too much
+- Run notebook with latest changes to training
 - think about ways to generate not completely random orderbook
 - look at what part of sample generating takes time
 - invert the GNN to have best values on edges for the item loc part
