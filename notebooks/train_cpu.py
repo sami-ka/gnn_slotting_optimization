@@ -346,6 +346,11 @@ def main():
     torch.save(test_dataset, "test_dataset_cpu.pt")
     print("  Saved: test_dataset_cpu.pt")
 
+    # Save raw samples for simulator verification
+    test_samples = samples[split_idx:]  # Same indices as test_dataset
+    torch.save(test_samples, "test_samples_cpu.pt")
+    print("  Saved: test_samples_cpu.pt")
+
     # ========================================================================
     # Test Assignment Sensitivity
     # ========================================================================
