@@ -392,8 +392,7 @@ def test_3d_sparse_values_match_submatrices(small_setup):
         attr_vec = attrs[idx]
         mask_vec = masks[idx]
 
-        # Verify exactly one dimension is active
-        assert mask_vec.sum() == 1, f"Edge {idx} should have exactly one type"
+        assert mask_vec.sum() == 1
 
         if mask_vec[2]:  # Item→Location
             item_idx = src
@@ -446,7 +445,7 @@ def test_3d_dense_values_match_submatrices(small_setup):
         attr_vec = attrs[idx]
         mask_vec = masks[idx]
 
-        assert mask_vec.sum() == 1, f"Edge {idx} should have exactly one type"
+        assert mask_vec.sum() == 1
 
         if mask_vec[2]:  # Item→Location
             item_idx = src
@@ -909,7 +908,6 @@ def test_3d_graph_with_real_sample_data():
     assert data.edge_attr.shape == (data.edge_index.shape[1], 3)
     assert data.edge_type_mask.shape == (data.edge_index.shape[1], 3)
 
-    # Verify all edges have exactly one type
     masks = data.edge_type_mask.numpy()
     assert all(masks.sum(axis=1) == 1), "Each edge should have exactly one type"
 
@@ -956,5 +954,4 @@ def test_3d_graph_large_scale():
     assert item_to_loc_count > 0, "Should have Item→Location edges"
     # Item→Item count can be 0 or more depending on order sequences
 
-    # Verify mutually exclusive
     assert all(masks.sum(axis=1) == 1), "Each edge should have exactly one type"

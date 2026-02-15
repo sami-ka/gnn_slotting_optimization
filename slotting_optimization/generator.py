@@ -60,9 +60,6 @@ class DataGenerator:
         # Generate nb_items SKUs (sequential naming)
         skus = [f"sku{i}" for i in range(nb_items)]
 
-        # Randomly select which locations get items (always use random sampling)
-        selected_locations = rng.sample(locations, nb_items)
-
         # If distances_fixed, create base warehouse once with all distances set
         base_warehouse = None
         if distances_fixed:
@@ -77,13 +74,35 @@ class DataGenerator:
 
         samples: List[Tuple[OrderBook, ItemLocations, Warehouse]] = []
 
+        # Generate orders ONCE (shared across all samples when distances_fixed)
+        # This ensures the model learns from assignment variations, not order variations
+        base_order_book = None
+        if distances_fixed:
+            order_dicts = []
+            base_ts = int(time.time())
+            for oid in range(n_orders):
+                k = rng.randint(min_items_per_order, max_items_per_order)
+                for item_idx in range(k):
+                    sku = rng.choice(skus)
+                    epoch_ts = base_ts + oid * 60 + item_idx
+                    order_dicts.append({
+                        "order_id": f"o{oid}",
+                        "item_id": sku,
+                        "timestamp": datetime.fromtimestamp(epoch_ts)
+                    })
+            base_order_book = OrderBook.from_dicts_direct(order_dicts)
+
         for sidx in range(n_samples):
+            # Randomly select which locations get items (different per sample)
+            selected_locations = rng.sample(locations, nb_items)
+
             # Build ItemLocations
             il = ItemLocations.from_records([{"item_id": sku, "location_id": loc} for sku, loc in zip(skus, selected_locations)])
 
             # Reuse warehouse when distances fixed
             if distances_fixed:
                 w = base_warehouse  # Share reference - read-only after creation
+                ob = base_order_book  # Share same orders - only assignments vary
             else:
                 # Create new warehouse for variable distances case
                 sample_seed = rng.randint(0, 2**30 - 1)
@@ -93,22 +112,21 @@ class DataGenerator:
                              start_point_id="start", end_point_id="end")
                 w.set_distances_bulk(dist_map)  # Use bulk method
 
-            # Generate orders (logical orders). Each logical order gets k items (between min and max)
-            # Create order dicts directly with datetime objects - no intermediate Order objects
-            order_dicts = []
-            base_ts = int(time.time()) + sidx * 1000000  # offset per sample to avoid collisions
-            for oid in range(n_orders):
-                k = rng.randint(min_items_per_order, max_items_per_order)
-                for item_idx in range(k):
-                    sku = rng.choice(skus)
-                    epoch_ts = base_ts + oid * 60 + item_idx  # ensure increasing-ish timestamps
-                    order_dicts.append({
-                        "order_id": f"o{oid}",
-                        "item_id": sku,
-                        "timestamp": datetime.fromtimestamp(epoch_ts)
-                    })
+                # Generate orders for this sample
+                order_dicts = []
+                base_ts = int(time.time()) + sidx * 1000000
+                for oid in range(n_orders):
+                    k = rng.randint(min_items_per_order, max_items_per_order)
+                    for item_idx in range(k):
+                        sku = rng.choice(skus)
+                        epoch_ts = base_ts + oid * 60 + item_idx
+                        order_dicts.append({
+                            "order_id": f"o{oid}",
+                            "item_id": sku,
+                            "timestamp": datetime.fromtimestamp(epoch_ts)
+                        })
+                ob = OrderBook.from_dicts_direct(order_dicts)
 
-            ob = OrderBook.from_dicts_direct(order_dicts)
             samples.append((ob, il, w))
 
         return samples
