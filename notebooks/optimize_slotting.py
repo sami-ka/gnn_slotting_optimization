@@ -86,6 +86,7 @@ class GraphRegressionModel(nn.Module):
     def __init__(self, hidden_dim, edge_dim, num_layers):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.node_embedding = nn.Embedding(256, hidden_dim)  # per-node-index embedding
         self.edge_encoder = nn.Linear(edge_dim, hidden_dim)
         self.layers = nn.ModuleList(
             [GCNBlock(hidden_dim, hidden_dim) for _ in range(num_layers)]
@@ -97,7 +98,14 @@ class GraphRegressionModel(nn.Module):
         )
 
     def forward(self, x, edge_index, edge_attr, batch=None):
-        """Forward pass with explicit inputs (for gradient optimization)."""
+        """Forward pass with explicit inputs (for gradient optimization).
+
+        Args:
+            x: Node features [num_nodes, hidden_dim] - can be from node_embedding
+            edge_index: Edge connectivity [2, num_edges]
+            edge_attr: Edge attributes [num_edges, 3]
+            batch: Batch assignment [num_nodes] (optional, defaults to single graph)
+        """
         edge_attr_enc = self.edge_encoder(edge_attr)
         for layer in self.layers:
             x, edge_attr_enc = layer(x, edge_index, edge_attr_enc)
@@ -360,9 +368,13 @@ def optimize_assignment(
     temp_decay = (final_temp / initial_temp) ** (1.0 / n_steps)
     temp = initial_temp
 
+    # Compute node features from node embedding (same as training)
+    # Detach since we're optimizing log_alpha, not model weights
+    nodes_per_graph = n_items + data.n_locs
+    node_ids = torch.arange(dense_data.num_nodes) % nodes_per_graph
+    x = model.node_embedding(node_ids).detach()
+
     # Score original assignment first
-    torch.manual_seed(seed)
-    x_init = torch.randn(dense_data.num_nodes, model.hidden_dim) * 0.01
     original_soft = torch.zeros(n_items, n_storage)
     for item_idx, loc_idx in enumerate(current_assignment):
         original_soft[item_idx, loc_idx] = 1.0
@@ -370,7 +382,7 @@ def optimize_assignment(
         dense_data.edge_attr, original_soft, edge_info
     )
     with torch.no_grad():
-        original_pred_norm = model(x_init, dense_data.edge_index, original_edge_attr)
+        original_pred_norm = model(x, dense_data.edge_index, original_edge_attr)
         original_pred = original_pred_norm.item() * std_y + mean_y
 
     if verbose:
@@ -388,9 +400,8 @@ def optimize_assignment(
         # Inject into edge attributes
         edge_attr = inject_soft_assignment(dense_data.edge_attr, soft_assign, edge_info)
 
-        # Forward pass with fixed random seed
-        torch.manual_seed(seed)
-        x = torch.randn(dense_data.num_nodes, model.hidden_dim) * 0.01
+        # Forward pass using node embedding features
+        # Note: x is computed once before the loop and reused
         pred_norm = model(x, dense_data.edge_index, edge_attr)
 
         # Backward pass
@@ -420,8 +431,7 @@ def optimize_assignment(
         final_hard[item_idx, loc_idx] = 1.0
     final_edge_attr = inject_soft_assignment(dense_data.edge_attr, final_hard, edge_info)
 
-    torch.manual_seed(seed)
-    x = torch.randn(dense_data.num_nodes, model.hidden_dim) * 0.01
+    # Use same node embedding features for final scoring
     with torch.no_grad():
         final_pred_norm = model(x, dense_data.edge_index, final_edge_attr)
         final_pred = final_pred_norm.item() * std_y + mean_y
@@ -499,8 +509,12 @@ def score_assignment_sparse(
     """Score an assignment using sparse graph structure."""
     modified_data = apply_assignment_to_data(data, assignment)
 
-    torch.manual_seed(seed)
-    x = torch.randn(modified_data.num_nodes, model.hidden_dim) * 0.01
+    # Compute node features from node embedding (same as training)
+    n_items = data.n_items
+    n_locs = data.n_locs
+    nodes_per_graph = n_items + n_locs
+    node_ids = torch.arange(modified_data.num_nodes) % nodes_per_graph
+    x = model.node_embedding(node_ids)
 
     with torch.no_grad():
         pred_norm = model(x, modified_data.edge_index, modified_data.edge_attr)
