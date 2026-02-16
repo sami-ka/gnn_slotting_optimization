@@ -20,8 +20,15 @@ import numpy as np
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from slotting_optimization.simulator import Simulator
-from slotting_optimization.item_locations import ItemLocations
+
+# Import shared functions from inverse_optimizer module
+from slotting_optimization.inverse_optimizer import (
+    sinkhorn,
+    extract_current_assignment,
+    create_dense_assignment_graph,
+    inject_soft_assignment,
+    verify_with_simulator,
+)
 
 
 # ============================================================================
@@ -119,205 +126,6 @@ class GraphRegressionModel(nn.Module):
         graph_emb = global_add_pool(x, batch)
         out = self.regressor(graph_emb)
         return out.squeeze(-1)
-
-
-# ============================================================================
-# Sinkhorn Algorithm (Soft Permutation)
-# ============================================================================
-
-
-def sinkhorn(log_alpha: torch.Tensor, n_iters: int = 20, temperature: float = 0.1):
-    """
-    Convert logits to doubly-stochastic matrix via Sinkhorn iterations.
-
-    Args:
-        log_alpha: [n_items, n_locations] raw logits
-        n_iters: Number of normalization iterations
-        temperature: Lower = sharper assignments
-
-    Returns:
-        Doubly-stochastic matrix (rows and columns sum to 1)
-    """
-    M = log_alpha / temperature
-    for _ in range(n_iters):
-        M = M - M.logsumexp(dim=1, keepdim=True)  # Row normalize
-        M = M - M.logsumexp(dim=0, keepdim=True)  # Col normalize
-    return M.exp()
-
-
-# ============================================================================
-# Graph Manipulation for Dense Item-Location Edges
-# ============================================================================
-
-
-def create_dense_assignment_graph(data: Data, n_items: int, n_storage: int):
-    """
-    Create a new graph with ALL possible Item->Location edges (dense).
-
-    Original graph has sparse Item->Loc edges (only current assignments).
-    We need dense edges for gradient optimization over all possible assignments.
-
-    Returns:
-        new_data: Data with dense Item->Loc edges
-        edge_info: Dict with indices for assignment edge manipulation
-    """
-    # Extract existing edges by type
-    edge_index = data.edge_index
-    edge_attr = data.edge_attr
-    edge_type_mask = data.edge_type_mask
-
-    loc_loc_mask = edge_type_mask[:, 0]
-    item_item_mask = edge_type_mask[:, 1]
-    item_loc_mask = edge_type_mask[:, 2]
-
-    # Get normalized values for Item->Loc edges from existing data
-    # These are the normalized constants for dims 0, 1 (should be same for all Item->Loc edges)
-    existing_item_loc_attr = edge_attr[item_loc_mask]
-    if len(existing_item_loc_attr) > 0:
-        dim0_norm = existing_item_loc_attr[0, 0].item()  # Normalized 0 for distance
-        dim1_norm = existing_item_loc_attr[0, 1].item()  # Normalized 0 for sequence
-        dim2_assigned = existing_item_loc_attr[0, 2].item()  # Normalized 1 (assigned)
-    else:
-        # Fallback values (shouldn't happen)
-        dim0_norm = -0.89
-        dim1_norm = -0.73
-        dim2_assigned = 6.44
-
-    # Compute normalized value for "not assigned" (raw=0)
-    # From the data: assigned (raw=1) -> 6.44, not_assigned (raw=0) -> -0.16
-    # This is (raw - mean) / std normalization
-    # We can compute: dim2_not_assigned = dim2_assigned - 1/std
-    # But simpler: just compute from data statistics
-    all_dim2 = edge_attr[:, 2]
-    # The min value (excluding assigned) is the "not assigned" normalized value
-    dim2_not_assigned = all_dim2[~item_loc_mask].min().item() if (~item_loc_mask).any() else -0.16
-
-    # Keep Loc->Loc and Item->Item edges unchanged
-    keep_mask = loc_loc_mask | item_item_mask
-    kept_edge_index = edge_index[:, keep_mask]
-    kept_edge_attr = edge_attr[keep_mask]
-    kept_edge_type_mask = edge_type_mask[keep_mask]
-
-    # Create ALL Item->Location edges (dense: n_items * n_storage)
-    # Items are nodes 0 to n_items-1
-    # Locations are nodes n_items to n_items+n_storage-1
-    item_indices = []
-    loc_indices = []
-    for item_idx in range(n_items):
-        for loc_idx in range(n_storage):
-            item_indices.append(item_idx)
-            loc_indices.append(n_items + loc_idx)
-
-    new_item_loc_edges = torch.tensor(
-        [item_indices, loc_indices], dtype=torch.long
-    )
-
-    # Create edge attributes for new Item->Loc edges with proper normalization
-    n_new_edges = n_items * n_storage
-    new_edge_attr = torch.zeros(n_new_edges, 3)
-    new_edge_attr[:, 0] = dim0_norm  # Normalized 0 for distance
-    new_edge_attr[:, 1] = dim1_norm  # Normalized 0 for sequence
-    new_edge_attr[:, 2] = dim2_not_assigned  # Will be updated by soft assignment
-
-    # Create edge type mask for new edges
-    new_edge_type_mask = torch.zeros(n_new_edges, 3, dtype=torch.bool)
-    new_edge_type_mask[:, 2] = True  # All are Item->Loc type
-
-    # Concatenate
-    final_edge_index = torch.cat([kept_edge_index, new_item_loc_edges], dim=1)
-    final_edge_attr = torch.cat([kept_edge_attr, new_edge_attr], dim=0)
-    final_edge_type_mask = torch.cat([kept_edge_type_mask, new_edge_type_mask], dim=0)
-
-    # Build edge info for quick assignment injection
-    n_kept = kept_edge_index.shape[1]
-
-    # Map (item_idx, loc_idx) to edge index
-    item_loc_to_edge = {}
-    for i, (item_idx, loc_idx) in enumerate(zip(item_indices, loc_indices)):
-        item_loc_to_edge[(item_idx, loc_idx - n_items)] = n_kept + i
-
-    new_data = Data(
-        edge_index=final_edge_index,
-        edge_attr=final_edge_attr,
-        edge_type_mask=final_edge_type_mask,
-        num_nodes=data.num_nodes,
-        n_items=data.n_items,
-        n_locs=data.n_locs,
-        n_storage=data.n_storage,
-    )
-
-    edge_info = {
-        "assignment_start_idx": n_kept,
-        "n_assignment_edges": n_new_edges,
-        "item_loc_to_edge": item_loc_to_edge,
-        "n_items": n_items,
-        "n_storage": n_storage,
-        "dim2_assigned": dim2_assigned,
-        "dim2_not_assigned": dim2_not_assigned,
-    }
-
-    return new_data, edge_info
-
-
-def inject_soft_assignment(
-    edge_attr: torch.Tensor,
-    soft_assignment: torch.Tensor,
-    edge_info: dict,
-) -> torch.Tensor:
-    """
-    Inject soft assignment values into edge_attr dimension 2.
-
-    Maps soft assignment [0, 1] to normalized values matching training data.
-
-    Args:
-        edge_attr: [n_edges, 3] edge attributes
-        soft_assignment: [n_items, n_storage] doubly-stochastic matrix (values in [0, 1])
-        edge_info: Dict from create_dense_assignment_graph
-
-    Returns:
-        Modified edge_attr with normalized assignment values in dim 2
-    """
-    new_edge_attr = edge_attr.clone()
-    start_idx = edge_info["assignment_start_idx"]
-    n_edges = edge_info["n_assignment_edges"]
-
-    # Map soft assignment [0, 1] to normalized space
-    # 0 -> dim2_not_assigned, 1 -> dim2_assigned
-    dim2_assigned = edge_info["dim2_assigned"]
-    dim2_not_assigned = edge_info["dim2_not_assigned"]
-
-    # Linear interpolation: normalized = not_assigned + soft * (assigned - not_assigned)
-    flat_assignment = soft_assignment.reshape(-1)
-    normalized_assignment = (
-        dim2_not_assigned + flat_assignment * (dim2_assigned - dim2_not_assigned)
-    )
-
-    new_edge_attr[start_idx : start_idx + n_edges, 2] = normalized_assignment
-
-    return new_edge_attr
-
-
-def extract_current_assignment(data: Data) -> np.ndarray:
-    """
-    Extract current item->location assignment from sparse graph.
-
-    Returns:
-        assignment: [n_items] array where assignment[i] = location index for item i
-    """
-    edge_type_mask = data.edge_type_mask
-    item_loc_mask = edge_type_mask[:, 2]
-    item_loc_edges = data.edge_index[:, item_loc_mask]
-
-    n_items = data.n_items
-    assignment = np.zeros(n_items, dtype=np.int64)
-
-    for i in range(item_loc_edges.shape[1]):
-        item_idx = item_loc_edges[0, i].item()
-        loc_node_idx = item_loc_edges[1, i].item()
-        loc_idx = loc_node_idx - n_items  # Convert node index to storage index
-        assignment[item_idx] = loc_idx
-
-    return assignment
 
 
 # ============================================================================
@@ -436,7 +244,9 @@ def optimize_assignment(
     final_hard = torch.zeros(n_items, n_storage)
     for item_idx, loc_idx in enumerate(final_assignment):
         final_hard[item_idx, loc_idx] = 1.0
-    final_edge_attr = inject_soft_assignment(dense_data.edge_attr, final_hard, edge_info)
+    final_edge_attr = inject_soft_assignment(
+        dense_data.edge_attr, final_hard, edge_info
+    )
 
     # Use same node embedding features for final scoring
     with torch.no_grad():
@@ -551,18 +361,19 @@ def optimize_swaps(
     current_assignment = extract_current_assignment(data)
 
     # Score original
-    original_score = score_assignment_sparse(model, data, current_assignment, mean_y, std_y, seed)
+    original_score = score_assignment_sparse(
+        model, data, current_assignment, mean_y, std_y, seed
+    )
 
     if verbose:
         print(f"Original predicted distance: {original_score:.1f}")
-        print(f"\nSearching for improving swaps...")
+        print("\nSearching for improving swaps...")
 
     best_assignment = current_assignment.copy()
     best_score = original_score
     history = [original_score]
 
     for iteration in range(max_iters):
-        improved = False
         best_swap = None
         best_swap_score = best_score
 
@@ -570,7 +381,9 @@ def optimize_swaps(
         for i in range(n_items):
             for j in range(i + 1, n_items):
                 swapped = swap_assignment(best_assignment, i, j)
-                score = score_assignment_sparse(model, data, swapped, mean_y, std_y, seed)
+                score = score_assignment_sparse(
+                    model, data, swapped, mean_y, std_y, seed
+                )
 
                 if score < best_swap_score:
                     best_swap_score = score
@@ -581,12 +394,13 @@ def optimize_swaps(
             best_assignment = swap_assignment(best_assignment, i, j)
             improvement = best_score - best_swap_score
             best_score = best_swap_score
-            improved = True
             history.append(best_score)
 
             if verbose:
-                print(f"  Iter {iteration}: Swap items {i}<->{j}, "
-                      f"distance: {best_score:.1f} (improved by {improvement:.1f})")
+                print(
+                    f"  Iter {iteration}: Swap items {i}<->{j}, "
+                    f"distance: {best_score:.1f} (improved by {improvement:.1f})"
+                )
         else:
             if verbose:
                 print(f"  Iter {iteration}: No improving swap found. Stopping.")
@@ -609,48 +423,6 @@ def optimize_swaps(
 
 
 # ============================================================================
-# Simulator Verification
-# ============================================================================
-
-
-def verify_with_simulator(
-    original_assignment: np.ndarray,
-    optimized_assignment: np.ndarray,
-    raw_sample: tuple,  # (OrderBook, ItemLocations, Warehouse)
-) -> dict:
-    """Run both assignments through real simulator and compare."""
-    order_book, original_il, warehouse = raw_sample
-    simulator = Simulator()
-
-    # Get item IDs from original ItemLocations (sorted to match graph node order)
-    items = sorted(original_il.to_dict().keys())
-
-    # Original distance (should match ground truth)
-    orig_dist, _ = simulator.simulate(order_book, warehouse, original_il)
-
-    # Build new ItemLocations with optimized assignment
-    # Map assignment indices back to location IDs
-    storage_locs = sorted([loc for loc in warehouse.locations()
-                           if loc not in (warehouse.start_point, warehouse.end_point)])
-
-    new_records = []
-    for i, item in enumerate(items):
-        new_loc_idx = optimized_assignment[i]
-        new_records.append({"item_id": item, "location_id": storage_locs[new_loc_idx]})
-
-    new_il = ItemLocations.from_records(new_records)
-    opt_dist, _ = simulator.simulate(order_book, warehouse, new_il)
-
-    improvement = (orig_dist - opt_dist) / orig_dist * 100
-
-    return {
-        "original_sim_distance": orig_dist,
-        "optimized_sim_distance": opt_dist,
-        "sim_improvement_pct": improvement,
-    }
-
-
-# ============================================================================
 # Main
 # ============================================================================
 
@@ -660,10 +432,19 @@ def main():
     parser.add_argument("--sample_idx", type=int, default=0, help="Test sample index")
     parser.add_argument("--n_steps", type=int, default=100, help="Optimization steps")
     parser.add_argument("--lr", type=float, default=0.5, help="Learning rate")
-    parser.add_argument("--method", type=str, default="swap", choices=["swap", "gradient"],
-                        help="Optimization method")
-    parser.add_argument("--model", type=str, default="model_cpu.pt", help="Model checkpoint path")
-    parser.add_argument("--data", type=str, default="test_dataset_cpu.pt", help="Test data path")
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="swap",
+        choices=["swap", "gradient"],
+        help="Optimization method",
+    )
+    parser.add_argument(
+        "--model", type=str, default="model_cpu.pt", help="Model checkpoint path"
+    )
+    parser.add_argument(
+        "--data", type=str, default="test_dataset_cpu.pt", help="Test data path"
+    )
     args = parser.parse_args()
 
     print("=" * 60)
@@ -683,7 +464,9 @@ def main():
         hidden_dim = 64
         num_layers = 5
 
-    model = GraphRegressionModel(hidden_dim=hidden_dim, edge_dim=3, num_layers=num_layers)
+    model = GraphRegressionModel(
+        hidden_dim=hidden_dim, edge_dim=3, num_layers=num_layers
+    )
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
@@ -737,7 +520,9 @@ def main():
 
     # Verify with real simulator
     try:
-        raw_samples = torch.load("test_samples_cpu.pt", map_location=device, weights_only=False)
+        raw_samples = torch.load(
+            "test_samples_cpu.pt", map_location=device, weights_only=False
+        )
         raw_sample = raw_samples[args.sample_idx]
 
         sim_result = verify_with_simulator(
@@ -753,7 +538,9 @@ def main():
         print(f"  Optimized (simulator): {sim_result['optimized_sim_distance']:.1f}")
         print(f"  Real improvement:      {sim_result['sim_improvement_pct']:.2f}%")
     except FileNotFoundError:
-        print("\nNote: test_samples_cpu.pt not found. Re-run train_cpu.py to enable simulator verification.")
+        print(
+            "\nNote: test_samples_cpu.pt not found. Re-run train_cpu.py to enable simulator verification."
+        )
 
 
 if __name__ == "__main__":
