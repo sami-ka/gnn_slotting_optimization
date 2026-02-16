@@ -9,12 +9,19 @@ Usage:
 """
 
 import argparse
+import sys
+import os
 import torch
 import torch.nn as nn
 from torch_geometric.nn import MessagePassing, global_add_pool
 from torch_geometric.data import Data
 from scipy.optimize import linear_sum_assignment
 import numpy as np
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from slotting_optimization.simulator import Simulator
+from slotting_optimization.item_locations import ItemLocations
 
 
 # ============================================================================
@@ -601,6 +608,53 @@ def optimize_swaps(
     }
 
 
+# ============================================================================
+# Simulator Verification
+# ============================================================================
+
+
+def verify_with_simulator(
+    original_assignment: np.ndarray,
+    optimized_assignment: np.ndarray,
+    raw_sample: tuple,  # (OrderBook, ItemLocations, Warehouse)
+) -> dict:
+    """Run both assignments through real simulator and compare."""
+    order_book, original_il, warehouse = raw_sample
+    simulator = Simulator()
+
+    # Get item IDs from original ItemLocations (sorted to match graph node order)
+    items = sorted(original_il.to_dict().keys())
+
+    # Original distance (should match ground truth)
+    orig_dist, _ = simulator.simulate(order_book, warehouse, original_il)
+
+    # Build new ItemLocations with optimized assignment
+    # Map assignment indices back to location IDs
+    storage_locs = sorted([loc for loc in warehouse.locations()
+                           if loc not in (warehouse.start_point, warehouse.end_point)])
+
+    new_records = []
+    for i, item in enumerate(items):
+        new_loc_idx = optimized_assignment[i]
+        new_records.append({"item_id": item, "location_id": storage_locs[new_loc_idx]})
+
+    new_il = ItemLocations.from_records(new_records)
+    opt_dist, _ = simulator.simulate(order_book, warehouse, new_il)
+
+    improvement = (orig_dist - opt_dist) / orig_dist * 100
+
+    return {
+        "original_sim_distance": orig_dist,
+        "optimized_sim_distance": opt_dist,
+        "sim_improvement_pct": improvement,
+    }
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+
 def main():
     parser = argparse.ArgumentParser(description="Optimize warehouse slotting via GNN")
     parser.add_argument("--sample_idx", type=int, default=0, help="Test sample index")
@@ -680,6 +734,26 @@ def main():
             print(f"  Item {i}: Loc {orig[i]} -> Loc {opt[i]}")
             changes += 1
     print(f"\nTotal items moved: {changes}/{len(orig)}")
+
+    # Verify with real simulator
+    try:
+        raw_samples = torch.load("test_samples_cpu.pt", map_location=device, weights_only=False)
+        raw_sample = raw_samples[args.sample_idx]
+
+        sim_result = verify_with_simulator(
+            result["original_assignment"],
+            result["optimized_assignment"],
+            raw_sample,
+        )
+
+        print("\n" + "=" * 60)
+        print("Simulator Verification:")
+        print("=" * 60)
+        print(f"  Original (simulator):  {sim_result['original_sim_distance']:.1f}")
+        print(f"  Optimized (simulator): {sim_result['optimized_sim_distance']:.1f}")
+        print(f"  Real improvement:      {sim_result['sim_improvement_pct']:.2f}%")
+    except FileNotFoundError:
+        print("\nNote: test_samples_cpu.pt not found. Re-run train_cpu.py to enable simulator verification.")
 
 
 if __name__ == "__main__":
