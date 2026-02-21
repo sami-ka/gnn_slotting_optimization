@@ -1,26 +1,23 @@
-"""Inverse optimization for generating diverse optimized assignments.
+"""Inverse optimization for generating optimized assignments.
 
 This module provides gradient-based inverse optimization to find optimal item-location
-assignments by backpropagating through a trained GNN model. It supports generating
-diverse solutions via combinatorial parameter grids (seeds, initialization noise,
-temperature schedules).
+assignments by backpropagating through a trained GNN model. The approach is analogous
+to CNN activation maximization - a single gradient descent run on a continuous
+relaxation, discretized at the end via the Hungarian algorithm.
 
 Usage:
     from slotting_optimization.inverse_optimizer import (
-        DiversityConfig,
-        optimize_assignment_with_noise,
-        generate_diverse_optimizations,
+        optimize_assignment,
         assignment_to_graph_data,
     )
 
-    config = DiversityConfig()  # Default ~30 candidates per sample
-    optimizations = generate_diverse_optimizations(
-        model, data, raw_sample, mean_y, std_y, edge_mean, edge_std, config
+    result = optimize_assignment(model, data, mean_y, std_y)
+    graph_data = assignment_to_graph_data(
+        result["optimized_assignment"], raw_sample, simulator, edge_mean, edge_std, mean_y, std_y
     )
 """
 
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Dict, Any
+from typing import Tuple, Dict, Any
 import numpy as np
 import torch
 import torch.nn as nn
@@ -30,30 +27,6 @@ from scipy.optimize import linear_sum_assignment
 from .simulator import Simulator
 from .item_locations import ItemLocations
 from .gnn_builder import build_graph_3d_sparse
-
-
-@dataclass
-class DiversityConfig:
-    """Configuration for diverse optimization runs.
-
-    Default configuration generates ~30 candidates per sample:
-    5 seeds x 2 noise_scales x 3 temp_schedules = 30
-
-    Attributes:
-        seeds: Random seeds for initialization noise
-        init_noise_scales: Noise magnitude added to log_alpha initialization
-        temperature_schedules: List of (initial_temp, final_temp) pairs
-        n_steps: Number of optimization steps per run
-        lr: Learning rate for Adam optimizer
-    """
-
-    seeds: List[int] = field(default_factory=lambda: list(range(5)))
-    init_noise_scales: List[float] = field(default_factory=lambda: [0.0, 0.5])
-    temperature_schedules: List[Tuple[float, float]] = field(
-        default_factory=lambda: [(0.5, 0.001), (1.0, 0.01), (2.0, 0.001)]
-    )
-    n_steps: int = 100
-    lr: float = 0.5
 
 
 def sinkhorn(log_alpha: torch.Tensor, n_iters: int = 20, temperature: float = 0.1):
@@ -229,43 +202,37 @@ def inject_soft_assignment(
     return new_edge_attr
 
 
-def optimize_assignment_with_noise(
+def optimize_assignment(
     model: nn.Module,
     data: Data,
     mean_y: float,
     std_y: float,
-    n_steps: int = 100,
+    n_steps: int = 50,
     lr: float = 0.5,
-    initial_temp: float = 1.0,
-    final_temp: float = 0.01,
-    seed: int = 42,
-    init_noise_scale: float = 0.0,
+    temperature: float = 0.1,
     verbose: bool = False,
 ) -> Dict[str, Any]:
-    """Optimize item-location assignment via gradient descent through GNN.
+    """Single-run gradient-based assignment optimization.
 
-    Similar to optimize_assignment but with init_noise_scale parameter for
-    creating diverse starting points in the optimization landscape.
+    Analogous to CNN activation maximization - gradient descent on a continuous
+    relaxation (Sinkhorn), discretized at the end via the Hungarian algorithm.
 
     Args:
         model: Trained GNN model
         data: Original graph data (sparse assignment edges)
         mean_y, std_y: Normalization params for denormalizing predictions
         n_steps: Number of optimization steps
-        lr: Learning rate
-        initial_temp, final_temp: Temperature annealing range
-        seed: Random seed for deterministic noise initialization
-        init_noise_scale: Scale of random noise added to initial log_alpha
+        lr: Learning rate for gradient descent
+        temperature: Sinkhorn temperature (lower = sharper assignments)
         verbose: Print progress
 
     Returns:
-        Dict with optimization results including:
+        Dict with optimization results:
             - original_assignment: Starting assignment
             - optimized_assignment: Final discrete assignment
             - original_distance: Predicted distance for original
             - optimized_distance: Predicted distance for optimized
             - improvement_pct: Percentage improvement
-            - history: List of predicted distances during optimization
     """
     model.eval()
     n_items = data.n_items
@@ -277,20 +244,10 @@ def optimize_assignment_with_noise(
     # Create dense graph for optimization
     dense_data, edge_info = create_dense_assignment_graph(data, n_items, n_storage)
 
-    # Initialize assignment logits with noise for diversity
-    torch.manual_seed(seed)
-    log_alpha = torch.randn(n_items, n_storage) * init_noise_scale
-    log_alpha.requires_grad = True
-
-    # Bias toward current assignment
+    # Initialize assignment logits from current assignment
+    log_alpha = torch.zeros(n_items, n_storage, requires_grad=True)
     for item_idx, loc_idx in enumerate(current_assignment):
-        log_alpha.data[item_idx, loc_idx] += 2.0
-
-    optimizer = torch.optim.Adam([log_alpha], lr=lr)
-
-    # Temperature annealing schedule
-    temp_decay = (final_temp / initial_temp) ** (1.0 / n_steps)
-    temp = initial_temp
+        log_alpha.data[item_idx, loc_idx] = 2.0
 
     # Compute node features from node embedding (same as training)
     nodes_per_graph = n_items + data.n_locs
@@ -310,15 +267,15 @@ def optimize_assignment_with_noise(
 
     if verbose:
         print(f"Original assignment predicted distance: {original_pred:.1f}")
-        print(f"Optimizing (temp: {initial_temp:.3f} -> {final_temp:.3f})...")
+        print(f"Optimizing ({n_steps} steps, temp={temperature})...")
 
-    history = []
-
+    # Gradient descent loop (manual steps, simpler than Adam for this use case)
     for step in range(n_steps):
-        optimizer.zero_grad()
+        if log_alpha.grad is not None:
+            log_alpha.grad.zero_()
 
         # Sinkhorn to get soft permutation
-        soft_assign = sinkhorn(log_alpha, n_iters=20, temperature=temp)
+        soft_assign = sinkhorn(log_alpha, n_iters=20, temperature=temperature)
 
         # Inject into edge attributes
         edge_attr = inject_soft_assignment(dense_data.edge_attr, soft_assign, edge_info)
@@ -328,21 +285,17 @@ def optimize_assignment_with_noise(
 
         # Backward pass
         pred_norm.backward()
-        optimizer.step()
 
-        # Denormalize for logging
-        pred_dist = pred_norm.item() * std_y + mean_y
-        history.append(pred_dist)
+        # Manual gradient step (minimize distance)
+        log_alpha.data -= lr * log_alpha.grad
 
-        if verbose and (step % 20 == 0 or step == n_steps - 1):
-            print(f"  Step {step:3d}: distance={pred_dist:.1f}, temp={temp:.4f}")
-
-        # Anneal temperature
-        temp *= temp_decay
+        if verbose and (step % 10 == 0 or step == n_steps - 1):
+            pred_dist = pred_norm.item() * std_y + mean_y
+            print(f"  Step {step:3d}: distance={pred_dist:.1f}")
 
     # Final discretization via Hungarian algorithm
     with torch.no_grad():
-        final_soft = sinkhorn(log_alpha, n_iters=50, temperature=0.001)
+        final_soft = sinkhorn(log_alpha, n_iters=50, temperature=0.01)
         cost_matrix = -final_soft.numpy()
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         final_assignment = col_ind
@@ -371,54 +324,7 @@ def optimize_assignment_with_noise(
         "original_distance": original_pred,
         "optimized_distance": final_pred,
         "improvement_pct": improvement,
-        "history": history,
-        "config": {
-            "seed": seed,
-            "init_noise_scale": init_noise_scale,
-            "initial_temp": initial_temp,
-            "final_temp": final_temp,
-        },
     }
-
-
-def compute_assignment_similarity(a1: np.ndarray, a2: np.ndarray) -> float:
-    """Compute similarity between two assignments (fraction of matching locations)."""
-    return (a1 == a2).sum() / len(a1)
-
-
-def deduplicate_assignments(
-    results: List[Dict[str, Any]], threshold: float = 0.8
-) -> List[Dict[str, Any]]:
-    """Remove near-duplicate assignments based on similarity threshold.
-
-    Args:
-        results: List of optimization result dictionaries
-        threshold: Similarity threshold above which assignments are considered duplicates
-
-    Returns:
-        Filtered list with near-duplicates removed
-    """
-    if not results:
-        return []
-
-    unique_results = [results[0]]
-
-    for result in results[1:]:
-        assignment = result["optimized_assignment"]
-        is_duplicate = False
-
-        for unique_result in unique_results:
-            similarity = compute_assignment_similarity(
-                assignment, unique_result["optimized_assignment"]
-            )
-            if similarity > threshold:
-                is_duplicate = True
-                break
-
-        if not is_duplicate:
-            unique_results.append(result)
-
-    return unique_results
 
 
 def assignment_to_graph_data(
@@ -482,98 +388,6 @@ def assignment_to_graph_data(
     g_data.y = (g_data.y - mean_y) / std_y
 
     return g_data
-
-
-def generate_diverse_optimizations(
-    model: nn.Module,
-    data: Data,
-    raw_sample: Tuple,  # (OrderBook, ItemLocations, Warehouse)
-    mean_y: float,
-    std_y: float,
-    edge_mean: torch.Tensor,
-    edge_std: torch.Tensor,
-    config: DiversityConfig,
-    simulator: Optional[Simulator] = None,
-    dedup_threshold: float = 0.8,
-    verbose: bool = False,
-) -> List[Tuple[Data, Dict[str, Any]]]:
-    """Generate multiple diverse optimized assignments.
-
-    Uses combinatorial parameter grid (seeds, init_noise_scales, temperature_schedules)
-    to find diverse local optima in the assignment space.
-
-    Args:
-        model: Trained GNN model
-        data: Original graph data
-        raw_sample: Tuple of (OrderBook, ItemLocations, Warehouse)
-        mean_y, std_y: Target normalization params
-        edge_mean, edge_std: Edge attribute normalization params
-        config: DiversityConfig specifying parameter grid
-        simulator: Optional Simulator instance (created if not provided)
-        dedup_threshold: Similarity threshold for deduplication (0.8 = 80% same locations)
-        verbose: Print progress
-
-    Returns:
-        List of (Data, metadata) tuples where:
-            - Data: Normalized graph ready for training
-            - metadata: Dict with optimization info (config, distances, improvement)
-    """
-    if simulator is None:
-        simulator = Simulator()
-
-    all_results = []
-
-    # Generate all parameter combinations
-    for seed in config.seeds:
-        for noise_scale in config.init_noise_scales:
-            for initial_temp, final_temp in config.temperature_schedules:
-                result = optimize_assignment_with_noise(
-                    model=model,
-                    data=data,
-                    mean_y=mean_y,
-                    std_y=std_y,
-                    n_steps=config.n_steps,
-                    lr=config.lr,
-                    initial_temp=initial_temp,
-                    final_temp=final_temp,
-                    seed=seed,
-                    init_noise_scale=noise_scale,
-                    verbose=False,
-                )
-                all_results.append(result)
-
-    if verbose:
-        print(f"  Generated {len(all_results)} candidates")
-
-    # Deduplicate
-    unique_results = deduplicate_assignments(all_results, threshold=dedup_threshold)
-
-    if verbose:
-        print(f"  After dedup: {len(unique_results)} unique")
-
-    # Convert to graph Data objects
-    output = []
-    for result in unique_results:
-        graph_data = assignment_to_graph_data(
-            optimized_assignment=result["optimized_assignment"],
-            raw_sample=raw_sample,
-            simulator=simulator,
-            edge_mean=edge_mean,
-            edge_std=edge_std,
-            mean_y=mean_y,
-            std_y=std_y,
-        )
-
-        metadata = {
-            "config": result["config"],
-            "original_distance": result["original_distance"],
-            "optimized_distance": result["optimized_distance"],
-            "improvement_pct": result["improvement_pct"],
-        }
-
-        output.append((graph_data, metadata))
-
-    return output
 
 
 def verify_with_simulator(

@@ -1,8 +1,10 @@
 """
 Training with inverse optimization augmentation.
 
-Trains GNN model, then uses gradient-based inverse optimization to generate
-diverse optimized samples and augments the training set with ALL of them.
+Trains GNN model, then uses single-run gradient-based inverse optimization
+(analogous to CNN activation maximization) to generate one optimized sample
+per training sample. This is simpler and faster than the previous approach
+that ran 30 optimization candidates per sample.
 
 Usage:
     cd notebooks && uv run train_augmented.py
@@ -24,8 +26,8 @@ from slotting_optimization.generator import DataGenerator
 from slotting_optimization.gnn_builder import build_graph_3d_sparse
 from slotting_optimization.simulator import Simulator
 from slotting_optimization.inverse_optimizer import (
-    DiversityConfig,
-    generate_diverse_optimizations,
+    optimize_assignment,
+    assignment_to_graph_data,
 )
 
 
@@ -181,17 +183,9 @@ CONFIG = {
     # Training - Phase 2 (with augmentation)
     "epochs_phase2": 20,
     # Augmentation config
-    "augmentation_dedup_threshold": 0.99,
+    "augmentation_n_steps": 50,  # Steps per optimization (like CNN activation maximization)
+    "max_augmented_samples": 500,  # Stop generating after this many samples (None = no limit)
 }
-
-# Default diversity config (~30 candidates per sample)
-DIVERSITY_CONFIG = DiversityConfig(
-    seeds=list(range(5)),
-    init_noise_scales=[0.0, 0.5],
-    temperature_schedules=[(0.5, 0.001), (1.0, 0.01), (2.0, 0.001)],
-    n_steps=100,
-    lr=0.5,
-)
 
 
 def train_epoch(model, train_loader, optimizer, criterion, device, grad_clip):
@@ -239,10 +233,13 @@ def augment_dataset(
     std_y,
     edge_mean,
     edge_std,
-    config: DiversityConfig,
-    dedup_threshold: float = 0.8,
+    n_steps: int = 50,
+    max_samples: int = None,
 ) -> list:
-    """Generate ALL optimized samples to augment training set (no filtering).
+    """Generate one optimized sample per training sample.
+
+    Uses single-run gradient-based optimization (like CNN activation maximization)
+    to find an improved assignment for each training sample.
 
     Args:
         model: Trained GNN model
@@ -250,8 +247,8 @@ def augment_dataset(
         raw_train_samples: List of (OrderBook, ItemLocations, Warehouse) tuples
         mean_y, std_y: Target normalization params
         edge_mean, edge_std: Edge attribute normalization params
-        config: DiversityConfig for optimization diversity
-        dedup_threshold: Similarity threshold for deduplication
+        n_steps: Number of optimization steps per sample
+        max_samples: Stop generating after this many samples (None = no limit)
 
     Returns:
         List of augmented Data objects
@@ -259,48 +256,44 @@ def augment_dataset(
     model.eval()
     simulator = Simulator()
     augmented = []
-    total_candidates = 0
-    total_unique = 0
+
+    n_to_process = len(train_dataset)
+    if max_samples is not None:
+        n_to_process = min(n_to_process, max_samples)
 
     for idx, (data, raw_sample) in enumerate(
         tqdm(
             zip(train_dataset, raw_train_samples),
             desc="  Augmenting",
-            total=len(train_dataset),
+            total=n_to_process,
         )
     ):
-        new_samples = generate_diverse_optimizations(
+        # Check if we've reached the limit
+        if max_samples is not None and len(augmented) >= max_samples:
+            break
+
+        # Single optimization run (like CNN activation maximization)
+        result = optimize_assignment(
             model=model,
             data=data,
-            raw_sample=raw_sample,
             mean_y=mean_y,
             std_y=std_y,
+            n_steps=n_steps,
+        )
+
+        # Convert to graph Data
+        graph_data = assignment_to_graph_data(
+            optimized_assignment=result["optimized_assignment"],
+            raw_sample=raw_sample,
+            simulator=simulator,
             edge_mean=edge_mean,
             edge_std=edge_std,
-            config=config,
-            simulator=simulator,
-            dedup_threshold=dedup_threshold,
-            verbose=False,
+            mean_y=mean_y,
+            std_y=std_y,
         )
+        augmented.append(graph_data)
 
-        # Extract just the Data objects
-        augmented.extend([sample[0] for sample in new_samples])
-
-        # Track stats
-        n_candidates = (
-            len(config.seeds)
-            * len(config.init_noise_scales)
-            * len(config.temperature_schedules)
-        )
-        total_candidates += n_candidates
-        total_unique += len(new_samples)
-
-        if idx < 3:  # Print first few for verification
-            print(
-                f"    Sample {idx}: {n_candidates} candidates -> {len(new_samples)} unique"
-            )
-
-    print(f"  Total: {total_candidates} candidates -> {total_unique} unique samples")
+    print(f"  Generated {len(augmented)} augmented samples (1 per training sample)")
     return augmented
 
 
@@ -450,8 +443,8 @@ def main():
         std_y=std_y,
         edge_mean=edge_mean,
         edge_std=edge_std,
-        config=DIVERSITY_CONFIG,
-        dedup_threshold=CONFIG["augmentation_dedup_threshold"],
+        n_steps=CONFIG["augmentation_n_steps"],
+        max_samples=CONFIG["max_augmented_samples"],
     )
 
     print(f"  Generated {len(augmented)} augmented samples")
