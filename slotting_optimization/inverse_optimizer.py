@@ -209,13 +209,16 @@ def optimize_assignment(
     std_y: float,
     n_steps: int = 50,
     lr: float = 0.5,
-    temperature: float = 0.1,
+    initial_temp: float = 1.0,
+    final_temp: float = 0.01,
     verbose: bool = False,
 ) -> Dict[str, Any]:
     """Single-run gradient-based assignment optimization.
 
     Analogous to CNN activation maximization - gradient descent on a continuous
     relaxation (Sinkhorn), discretized at the end via the Hungarian algorithm.
+    Uses temperature annealing to balance exploration (high temp) and exploitation
+    (low temp).
 
     Args:
         model: Trained GNN model
@@ -223,7 +226,8 @@ def optimize_assignment(
         mean_y, std_y: Normalization params for denormalizing predictions
         n_steps: Number of optimization steps
         lr: Learning rate for gradient descent
-        temperature: Sinkhorn temperature (lower = sharper assignments)
+        initial_temp: Starting temperature (higher = softer, better gradients)
+        final_temp: Ending temperature (lower = sharper, closer to discrete)
         verbose: Print progress
 
     Returns:
@@ -244,10 +248,10 @@ def optimize_assignment(
     # Create dense graph for optimization
     dense_data, edge_info = create_dense_assignment_graph(data, n_items, n_storage)
 
-    # Initialize assignment logits from current assignment
+    # Initialize assignment logits from current assignment (smaller bias for exploration)
     log_alpha = torch.zeros(n_items, n_storage, requires_grad=True)
     for item_idx, loc_idx in enumerate(current_assignment):
-        log_alpha.data[item_idx, loc_idx] = 2.0
+        log_alpha.data[item_idx, loc_idx] = 1.0
 
     # Compute node features from node embedding (same as training)
     nodes_per_graph = n_items + data.n_locs
@@ -265,17 +269,21 @@ def optimize_assignment(
         original_pred_norm = model(x, dense_data.edge_index, original_edge_attr)
         original_pred = original_pred_norm.item() * std_y + mean_y
 
+    # Temperature annealing schedule
+    temp_decay = (final_temp / initial_temp) ** (1.0 / n_steps)
+    temp = initial_temp
+
     if verbose:
         print(f"Original assignment predicted distance: {original_pred:.1f}")
-        print(f"Optimizing ({n_steps} steps, temp={temperature})...")
+        print(f"Optimizing ({n_steps} steps, temp: {initial_temp:.3f} -> {final_temp:.3f})...")
 
     # Gradient descent loop (manual steps, simpler than Adam for this use case)
     for step in range(n_steps):
         if log_alpha.grad is not None:
             log_alpha.grad.zero_()
 
-        # Sinkhorn to get soft permutation
-        soft_assign = sinkhorn(log_alpha, n_iters=20, temperature=temperature)
+        # Sinkhorn to get soft permutation (higher temp = softer = better gradients)
+        soft_assign = sinkhorn(log_alpha, n_iters=20, temperature=temp)
 
         # Inject into edge attributes
         edge_attr = inject_soft_assignment(dense_data.edge_attr, soft_assign, edge_info)
@@ -291,7 +299,10 @@ def optimize_assignment(
 
         if verbose and (step % 10 == 0 or step == n_steps - 1):
             pred_dist = pred_norm.item() * std_y + mean_y
-            print(f"  Step {step:3d}: distance={pred_dist:.1f}")
+            print(f"  Step {step:3d}: distance={pred_dist:.1f}, temp={temp:.4f}")
+
+        # Anneal temperature
+        temp *= temp_decay
 
     # Final discretization via Hungarian algorithm
     with torch.no_grad():

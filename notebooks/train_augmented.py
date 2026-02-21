@@ -16,6 +16,7 @@ from torch_geometric.nn import MessagePassing, global_add_pool
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data
 from tqdm import tqdm
+import numpy as np
 import sys
 import os
 
@@ -28,6 +29,7 @@ from slotting_optimization.simulator import Simulator
 from slotting_optimization.inverse_optimizer import (
     optimize_assignment,
     assignment_to_graph_data,
+    verify_with_simulator,
 )
 
 
@@ -535,6 +537,81 @@ def main():
         print(f"  Validation loss improvement: {improvement:.1f}%")
     else:
         print(f"  Validation loss change: {improvement:.1f}%")
+
+    # ========================================================================
+    # Final Evaluation: Verify real improvement with simulator
+    # ========================================================================
+    print("\n" + "=" * 60)
+    print("Final Evaluation: Inverse Optimization with Simulator Verification")
+    print("=" * 60)
+
+    # Build fresh unnormalized test graphs for evaluation
+    # (The test_dataset was normalized in-place earlier, so we rebuild)
+    print("  Rebuilding unnormalized test graphs for evaluation...")
+    eval_test_graphs = []
+    for ob, il, w in raw_test_samples:
+        g_data = build_graph_3d_sparse(
+            order_book=ob,
+            item_locations=il,
+            warehouse=w,
+            simulator=simulator.simulate,
+        )
+        # Apply edge normalization (but NOT target normalization, that's handled by optimize_assignment)
+        g_data.edge_attr = (g_data.edge_attr - edge_mean) / (edge_std + 1e-8)
+        eval_test_graphs.append(g_data)
+
+    n_eval_samples = min(50, len(eval_test_graphs))  # Evaluate on subset of test set
+    print(f"  Evaluating {n_eval_samples} test samples...")
+
+    improvements_gnn = []
+    improvements_sim = []
+
+    for idx in tqdm(range(n_eval_samples), desc="  Evaluating"):
+        data = eval_test_graphs[idx]
+        raw_sample = raw_test_samples[idx]
+
+        # Run inverse optimization
+        result = optimize_assignment(
+            model=model,
+            data=data,
+            mean_y=mean_y,
+            std_y=std_y,
+            n_steps=CONFIG["augmentation_n_steps"],
+        )
+
+        # Verify with real simulator
+        sim_result = verify_with_simulator(
+            original_assignment=result["original_assignment"],
+            optimized_assignment=result["optimized_assignment"],
+            raw_sample=raw_sample,
+        )
+
+        improvements_gnn.append(result["improvement_pct"])
+        improvements_sim.append(sim_result["sim_improvement_pct"])
+
+    # Statistics
+    improvements_gnn = np.array(improvements_gnn)
+    improvements_sim = np.array(improvements_sim)
+
+    print("\n  GNN Predicted Improvements:")
+    print(f"    Mean:   {improvements_gnn.mean():.2f}%")
+    print(f"    Std:    {improvements_gnn.std():.2f}%")
+    print(f"    Min:    {improvements_gnn.min():.2f}%")
+    print(f"    Max:    {improvements_gnn.max():.2f}%")
+
+    print("\n  Real Simulator Improvements:")
+    print(f"    Mean:   {improvements_sim.mean():.2f}%")
+    print(f"    Std:    {improvements_sim.std():.2f}%")
+    print(f"    Min:    {improvements_sim.min():.2f}%")
+    print(f"    Max:    {improvements_sim.max():.2f}%")
+
+    # How many actually improved?
+    n_improved = (improvements_sim > 0).sum()
+    print(f"\n  Samples with real improvement: {n_improved}/{n_eval_samples} ({100*n_improved/n_eval_samples:.1f}%)")
+
+    # Correlation between GNN prediction and real improvement
+    correlation = np.corrcoef(improvements_gnn, improvements_sim)[0, 1]
+    print(f"  Correlation (GNN vs Simulator): {correlation:.3f}")
 
     print("\nDone!")
 
