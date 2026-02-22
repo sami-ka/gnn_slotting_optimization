@@ -172,9 +172,8 @@ def evaluate_candidate_pool(
         # Extract assignment from graph
         assignment = extract_current_assignment(data)
 
-        # Simulate - we need a raw_sample for this
-        # For samples beyond original training set (augmented), we use the first raw_sample
-        # since they all share the same order_book/warehouse
+        # Simulate - raw_samples now matches accumulated_dataset length exactly
+        # (augmented samples have their own raw_sample appended to accumulated_raw_samples)
         raw_idx = min(idx, len(raw_samples) - 1)
         distance = simulate_assignment(assignment, raw_samples[raw_idx], simulator)
 
@@ -423,8 +422,9 @@ def get_config_for_problem_size(n_items: int) -> dict:
         "batch_size": 32,
         "grad_clip": 1.0,
         "track_every_n_epochs": 5,
-        "n_augmentation_phases": 5,  # Number of augmentation cycles to run
+        "n_augmentation_phases": 2,  # Number of augmentation cycles to run
         "n_top_for_inverse_opt": 10,  # Top N by GNN prediction to inverse optimize
+        "perturbation_scale": 1.0,  # Random noise added to logit init for diversity
     }
 
     # Complexity scales roughly with search space size (n!)
@@ -490,57 +490,62 @@ def evaluate(model, test_loader, criterion, device):
 
 def augment_dataset(
     model,
-    train_dataset,
-    raw_train_samples,
+    top_graphs,
+    top_raw_samples,
     mean_y,
     std_y,
     edge_mean,
     edge_std,
     n_steps: int = 50,
-    n_top: int = 10,
-) -> list:
-    """Generate augmented samples by inverse optimizing top N samples by GNN prediction.
+    existing_assignments: set = None,
+    perturbation_scale: float = 0.0,
+) -> tuple:
+    """Generate augmented samples by inverse optimizing a pre-selected set of graphs.
 
     Uses single-run gradient-based optimization (like CNN activation maximization)
     to find an improved assignment for each selected sample.
 
     Args:
         model: Trained GNN model
-        train_dataset: List of training Data objects (unnormalized targets)
-        raw_train_samples: List of (OrderBook, ItemLocations, Warehouse) tuples
+        top_graphs: Pre-selected list of top-N Data objects (already normalized)
+        top_raw_samples: Corresponding list of (OrderBook, ItemLocations, Warehouse) tuples
         mean_y, std_y: Target normalization params
         edge_mean, edge_std: Edge attribute normalization params
         n_steps: Number of optimization steps per sample
-        n_top: Select top N samples by GNN prediction (lowest predicted distance)
+        existing_assignments: Set of assignment tuples already in the dataset (for deduplication)
+        perturbation_scale: Random noise scale for logit initialization diversity
 
     Returns:
-        List of augmented Data objects (normalized)
+        Tuple of (augmented Data objects, updated existing_assignments set,
+                  list of (raw_sample, graph_data) pairs for accepted augmented samples)
     """
     model.eval()
     simulator = Simulator()
     augmented = []
+    augmented_raw_and_graph = []  # (raw_sample, graph_data) for accepted samples
 
-    # Get GNN predictions for all samples
-    predictions = get_gnn_predictions(model, train_dataset, mean_y, std_y)
+    if existing_assignments is None:
+        existing_assignments = set()
 
-    # Sort indices by prediction (ascending - lower distance = better)
-    sorted_indices = np.argsort(predictions)
-    top_indices = sorted_indices[:n_top]
-
-    print(f"  Selected top {len(top_indices)} samples by GNN prediction for inverse optimization")
-
-    for idx in tqdm(top_indices, desc="  Augmenting"):
-        data = train_dataset[idx]
-        raw_sample = raw_train_samples[idx]
-
-        # Single optimization run (like CNN activation maximization)
+    n_duplicates = 0
+    for data, raw_sample in tqdm(zip(top_graphs, top_raw_samples), total=len(top_graphs), desc="  Augmenting"):
+        # Single optimization run with optional perturbation for diversity
         result = optimize_assignment(
             model=model,
             data=data,
             mean_y=mean_y,
             std_y=std_y,
             n_steps=n_steps,
+            perturbation_scale=perturbation_scale,
         )
+
+        # Check for duplicate assignment
+        assignment_tuple = tuple(result["optimized_assignment"])
+        if assignment_tuple in existing_assignments:
+            n_duplicates += 1
+            continue
+
+        existing_assignments.add(assignment_tuple)
 
         # Convert to graph Data
         graph_data = assignment_to_graph_data(
@@ -553,9 +558,10 @@ def augment_dataset(
             std_y=std_y,
         )
         augmented.append(graph_data)
+        augmented_raw_and_graph.append((raw_sample, graph_data))
 
-    print(f"  Generated {len(augmented)} augmented samples")
-    return augmented
+    print(f"  Generated {len(augmented)} augmented samples ({n_duplicates} duplicates skipped)")
+    return augmented, existing_assignments, augmented_raw_and_graph
 
 
 def main():
@@ -786,49 +792,53 @@ def main():
     # This allows the model to iteratively improve via self-generated data
 
     current_train_dataset = list(train_dataset)  # Copy to avoid modifying original
+    accumulated_raw_samples = list(raw_train_samples)  # Grows with augmented samples
     cumulative_epoch = CONFIG["epochs_phase1"]
     phase_best_losses = []
+
+    # Initialize existing_assignments set with assignments from original training dataset
+    existing_assignments = set()
+    for data in train_dataset:
+        assignment = extract_current_assignment(data)
+        existing_assignments.add(tuple(assignment))
+    print(f"  Initialized with {len(existing_assignments)} unique assignments from training set")
 
     for aug_phase_num in range(1, CONFIG["n_augmentation_phases"] + 1):
         phase_name = f"aug{aug_phase_num}"
         print(f"\n[{5 + aug_phase_num*2}/...] Augmentation Phase {aug_phase_num}: Generating samples...")
 
-        # Need unnormalized data for augmentation (assignment_to_graph_data handles normalization)
-        # The train_dataset was normalized in-place, so we rebuild for augmentation
-        print("  Rebuilding unnormalized training graphs for augmentation...")
-        aug_train_graphs = []
-        for ob, il, w in tqdm(raw_train_samples, desc="  Rebuilding"):
-            g_data = build_graph_3d_sparse(
-                order_book=ob,
-                item_locations=il,
-                warehouse=w,
-                simulator=simulator.simulate,
-            )
-            # Apply edge normalization (but NOT target normalization for optimization)
-            g_data.edge_attr = (g_data.edge_attr - edge_mean) / (edge_std + 1e-8)
-            aug_train_graphs.append(g_data)
+        # Select top-N from the full accumulated dataset (includes previously augmented samples)
+        predictions = get_gnn_predictions(model, current_train_dataset, mean_y, std_y)
+        sorted_indices = np.argsort(predictions)
+        top_indices = sorted_indices[:CONFIG["n_top_for_inverse_opt"]]
 
-        augmented = augment_dataset(
+        top_graphs = [current_train_dataset[i] for i in top_indices]
+        top_raw = [accumulated_raw_samples[i] for i in top_indices]
+
+        print(f"  Selected top {len(top_indices)} samples from {len(current_train_dataset)} accumulated samples")
+
+        augmented, existing_assignments, augmented_raw_and_graph = augment_dataset(
             model=model,
-            train_dataset=aug_train_graphs,
-            raw_train_samples=raw_train_samples,
+            top_graphs=top_graphs,
+            top_raw_samples=top_raw,
             mean_y=mean_y,
             std_y=std_y,
             edge_mean=edge_mean,
             edge_std=edge_std,
             n_steps=CONFIG["augmentation_n_steps"],
-            n_top=CONFIG["n_top_for_inverse_opt"],
+            existing_assignments=existing_assignments,
+            perturbation_scale=CONFIG["perturbation_scale"],
         )
-
-        print(f"  Generated {len(augmented)} augmented samples")
 
         # ========================================================================
         # Training with Augmented Data
         # ========================================================================
         print(f"\n[{6 + aug_phase_num*2}/...] Augmentation Phase {aug_phase_num}: Training...")
 
-        # Combine original and augmented
+        # Combine original and augmented; track raw samples for future phases
         current_train_dataset = current_train_dataset + augmented
+        for raw_s, _ in augmented_raw_and_graph:
+            accumulated_raw_samples.append(raw_s)
         print(f"  Training set size: {len(current_train_dataset)} samples (original + phase {aug_phase_num} augmentation)")
 
         train_loader_aug = DataLoader(
@@ -870,7 +880,7 @@ def main():
         eval_result = evaluate_candidate_pool(
             model=model,
             accumulated_dataset=current_train_dataset,
-            raw_samples=raw_train_samples,
+            raw_samples=accumulated_raw_samples,
             scenario=scenario,
             mean_y=mean_y,
             std_y=std_y,

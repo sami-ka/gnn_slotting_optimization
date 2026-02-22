@@ -212,6 +212,7 @@ def optimize_assignment(
     initial_temp: float = 1.0,
     final_temp: float = 0.01,
     verbose: bool = False,
+    perturbation_scale: float = 0.0,
 ) -> Dict[str, Any]:
     """Single-run gradient-based assignment optimization.
 
@@ -258,6 +259,8 @@ def optimize_assignment(
     log_alpha = torch.zeros(n_items, n_storage, requires_grad=True)
     for item_idx, loc_idx in enumerate(current_assignment):
         log_alpha.data[item_idx, loc_idx] = 1.0
+    if perturbation_scale > 0:
+        log_alpha.data += torch.randn(n_items, n_storage) * perturbation_scale
 
     # Compute node features from node embedding (same as training)
     nodes_per_graph = n_items + data.n_locs
