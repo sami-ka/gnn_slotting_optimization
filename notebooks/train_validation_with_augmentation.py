@@ -1,15 +1,12 @@
 """
-Training with validation framework to prove metaheuristic convergence.
+Training with validation framework AND augmentation to prove metaheuristic convergence.
 
-This script:
-1. Generates ONE validation scenario with known optimal (5 items, 5 locations)
-2. Verifies optimal via brute force enumeration
-3. Creates N training samples with different random initial assignments (same orders/warehouse)
-4. Trains the GNN model with convergence tracking
-5. Reports convergence to known optimum
+This script combines:
+- Validation framework from train_validation.py (known optimal via brute force)
+- Augmentation from train_augmented.py (inverse optimization to generate better samples)
 
 Usage:
-    cd notebooks && uv run train_validation.py
+    cd notebooks && uv run train_validation_with_augmentation.py
 """
 
 import torch
@@ -34,7 +31,10 @@ from slotting_optimization.validation import (
 )
 from slotting_optimization.gnn_builder import build_graph_3d_sparse
 from slotting_optimization.simulator import Simulator
-from slotting_optimization.inverse_optimizer import optimize_assignment
+from slotting_optimization.inverse_optimizer import (
+    optimize_assignment,
+    assignment_to_graph_data,
+)
 from slotting_optimization.item_locations import ItemLocations
 
 
@@ -165,16 +165,22 @@ class GraphRegressionModel(nn.Module):
 
 
 # ============================================================================
-# Training Configuration
+# Training Configuration - Scales with problem size
 # ============================================================================
 
 
 def get_config_for_problem_size(n_items: int) -> dict:
-    """Generate configuration scaled for problem size."""
+    """Generate configuration scaled for problem size.
+
+    Scaling rationale:
+    - Search space grows as n! (factorial), so larger problems need more exploration
+    - Learning rate scales inversely to prevent overshooting in larger spaces
+    - Epochs and steps scale with complexity ratio
+    """
     base_config = {
         "n_locations": n_items,
         "n_items": n_items,
-        "n_orders": max(100, n_items * 60),  # More orders for larger problems
+        "n_orders": max(100, n_items * 20),  # More orders for richer signal
         "n_samples": 500,
         "train_split": 0.8,
         "seed": 42,
@@ -184,24 +190,31 @@ def get_config_for_problem_size(n_items: int) -> dict:
         "grad_clip": 1.0,
         "track_every_n_epochs": 5,
         "max_augmented_samples": 250,
+        "n_augmentation_phases": 5,  # Number of augmentation cycles to run
     }
 
-    # Scale epochs with problem complexity
-    # 5x5 needs 30, 8x8 needs ~80 (336x harder search space)
+    # Complexity scales roughly with search space size (n!)
+    # For relative scaling, use (n/5)^2 as proxy
     complexity_ratio = (n_items / 5.0) ** 2
-    base_config["epochs_phase1"] = max(30, int(30 * complexity_ratio))
-    base_config["epochs_phase2"] = max(20, int(20 * complexity_ratio))
 
-    # Scale learning rate inversely with size
+    # Epochs scale with complexity
+    base_config["epochs_phase1"] = max(30, int(30 * complexity_ratio))
+    base_config["epochs_per_aug_phase"] = max(20, int(20 * complexity_ratio))
+
+    # Learning rate scales inversely with size (larger problems need finer steps)
     base_config["learning_rate"] = 0.001 / (n_items / 5.0)
 
-    # Scale optimization steps
+    # Optimization steps for augmentation scale with problem size
     base_config["augmentation_n_steps"] = max(50, n_items * 10)
 
     return base_config
 
 
-CONFIG = get_config_for_problem_size(8)
+# Default to 5x5 for debugging (fast brute force verification)
+# To run longer training with multiple augmentation cycles, modify:
+#   CONFIG["n_augmentation_phases"] = 3  # Run 3 augmentation cycles instead of 1
+#   CONFIG["epochs_per_aug_phase"] = 30  # More epochs per phase
+CONFIG = get_config_for_problem_size(5)
 
 
 def train_epoch(model, train_loader, optimizer, criterion, device, grad_clip):
@@ -253,7 +266,7 @@ def track_convergence(
         data=test_data,
         mean_y=mean_y,
         std_y=std_y,
-        n_steps=n_steps,  # Use passed value (None = auto-scale)
+        n_steps=n_steps,
         verbose=False,
     )
 
@@ -267,13 +280,88 @@ def track_convergence(
     return point
 
 
+def augment_dataset(
+    model,
+    train_dataset,
+    raw_train_samples,
+    mean_y,
+    std_y,
+    edge_mean,
+    edge_std,
+    n_steps: int = 50,
+    max_samples: int = None,
+) -> list:
+    """Generate one optimized sample per training sample.
+
+    Uses single-run gradient-based optimization (like CNN activation maximization)
+    to find an improved assignment for each training sample.
+
+    Args:
+        model: Trained GNN model
+        train_dataset: List of training Data objects (unnormalized targets)
+        raw_train_samples: List of (OrderBook, ItemLocations, Warehouse) tuples
+        mean_y, std_y: Target normalization params
+        edge_mean, edge_std: Edge attribute normalization params
+        n_steps: Number of optimization steps per sample
+        max_samples: Stop generating after this many samples (None = no limit)
+
+    Returns:
+        List of augmented Data objects (normalized)
+    """
+    model.eval()
+    simulator = Simulator()
+    augmented = []
+
+    n_to_process = len(train_dataset)
+    if max_samples is not None:
+        n_to_process = min(n_to_process, max_samples)
+
+    for idx, (data, raw_sample) in enumerate(
+        tqdm(
+            zip(train_dataset, raw_train_samples),
+            desc="  Augmenting",
+            total=n_to_process,
+        )
+    ):
+        # Check if we've reached the limit
+        if max_samples is not None and len(augmented) >= max_samples:
+            break
+
+        # Single optimization run (like CNN activation maximization)
+        result = optimize_assignment(
+            model=model,
+            data=data,
+            mean_y=mean_y,
+            std_y=std_y,
+            n_steps=n_steps,
+        )
+
+        # Convert to graph Data
+        graph_data = assignment_to_graph_data(
+            optimized_assignment=result["optimized_assignment"],
+            raw_sample=raw_sample,
+            simulator=simulator,
+            edge_mean=edge_mean,
+            edge_std=edge_std,
+            mean_y=mean_y,
+            std_y=std_y,
+        )
+        augmented.append(graph_data)
+
+    print(f"  Generated {len(augmented)} augmented samples")
+    return augmented
+
+
 def main():
     print("=" * 80)
-    print("VALIDATION: Training with Known Optimal to Prove Convergence")
+    print("VALIDATION WITH AUGMENTATION: Training to Prove Metaheuristic Convergence")
     print("=" * 80)
     print(f"Problem: {CONFIG['n_items']} items, {CONFIG['n_locations']} locations")
     print(f"Training samples: {CONFIG['n_samples']} (different random starting assignments)")
+    print(f"Augmentation: {CONFIG['n_augmentation_phases']} phase(s), up to {CONFIG['max_augmented_samples']} samples per phase")
     print(f"Tracking every {CONFIG['track_every_n_epochs']} epochs")
+    total_epochs = CONFIG['epochs_phase1'] + CONFIG['n_augmentation_phases'] * CONFIG['epochs_per_aug_phase']
+    print(f"Total training epochs: {total_epochs}")
     print()
 
     device = torch.device("cpu")
@@ -315,7 +403,7 @@ def main():
 
     # Create ValidationScenario
     scenario = ValidationScenario(
-        name="5x5_frequency_optimal",
+        name=f"{CONFIG['n_items']}x{CONFIG['n_locations']}_frequency_optimal",
         order_book=order_book,
         warehouse=warehouse,
         initial_assignment=random_initial,
@@ -397,7 +485,7 @@ def main():
         hidden_dim=CONFIG["hidden_dim"],
         edge_dim=3,
         num_layers=CONFIG["num_layers"],
-        max_nodes=max(256, (CONFIG["n_items"] + CONFIG["n_locations"]) * 2),  # Buffer
+        max_nodes=max(256, (CONFIG["n_items"] + CONFIG["n_locations"]) * 2),
     )
     model = model.to(device)
 
@@ -463,44 +551,97 @@ def main():
     print(f"\n  Phase 1 complete. Best val_loss: {best_val_loss:.4f}")
 
     # ========================================================================
-    # Phase 2: Augmentation (Optional - can skip for validation)
+    # Phases 2+: Iterative Augmentation Cycles
     # ========================================================================
-    print("\n[6/8] Phase 2: Training with augmentation...")
-    print("  (Skipping augmentation generation for faster validation)")
+    # Each cycle: generate augmented samples → train on combined dataset
+    # This allows the model to iteratively improve via self-generated data
 
-    # Reset optimizer for phase 2
-    optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG["learning_rate"])
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5
-    )
+    current_train_dataset = train_dataset
+    cumulative_epoch = CONFIG["epochs_phase1"]
+    phase_best_losses = []
 
-    best_val_loss_phase2 = float("inf")
+    for aug_phase_num in range(1, CONFIG["n_augmentation_phases"] + 1):
+        phase_name = f"aug{aug_phase_num}"
+        print(f"\n[{5 + aug_phase_num*2}/...] Augmentation Phase {aug_phase_num}: Generating samples...")
 
-    for epoch in range(CONFIG["epochs_phase2"]):
-        train_loss = train_epoch(
-            model, train_loader, optimizer, criterion, device, CONFIG["grad_clip"]
+        # Need unnormalized data for augmentation (assignment_to_graph_data handles normalization)
+        # The train_dataset was normalized in-place, so we rebuild for augmentation
+        print("  Rebuilding unnormalized training graphs for augmentation...")
+        aug_train_graphs = []
+        for ob, il, w in tqdm(raw_train_samples[:CONFIG["max_augmented_samples"]], desc="  Rebuilding"):
+            g_data = build_graph_3d_sparse(
+                order_book=ob,
+                item_locations=il,
+                warehouse=w,
+                simulator=simulator.simulate,
+            )
+            # Apply edge normalization (but NOT target normalization for optimization)
+            g_data.edge_attr = (g_data.edge_attr - edge_mean) / (edge_std + 1e-8)
+            aug_train_graphs.append(g_data)
+
+        augmented = augment_dataset(
+            model=model,
+            train_dataset=aug_train_graphs,
+            raw_train_samples=raw_train_samples[:CONFIG["max_augmented_samples"]],
+            mean_y=mean_y,
+            std_y=std_y,
+            edge_mean=edge_mean,
+            edge_std=edge_std,
+            n_steps=CONFIG["augmentation_n_steps"],
+            max_samples=CONFIG["max_augmented_samples"],
         )
-        val_loss = evaluate(model, test_loader, criterion, device)
-        scheduler.step(val_loss)
 
-        actual_epoch = CONFIG["epochs_phase1"] + epoch + 1
+        print(f"  Generated {len(augmented)} augmented samples")
 
-        if val_loss < best_val_loss_phase2:
-            best_val_loss_phase2 = val_loss
-            marker = " *"
-        else:
-            marker = ""
+        # ========================================================================
+        # Training with Augmented Data
+        # ========================================================================
+        print(f"\n[{6 + aug_phase_num*2}/...] Augmentation Phase {aug_phase_num}: Training...")
 
-        # Track convergence
-        if (epoch + 1) % CONFIG["track_every_n_epochs"] == 0 or epoch == CONFIG["epochs_phase2"] - 1:
-            point = track_convergence(
-                model, scenario, test_dataset[0], mean_y, std_y, actual_epoch, "phase2", tracker,
-                n_steps=CONFIG["augmentation_n_steps"]
+        # Combine original and augmented
+        current_train_dataset = current_train_dataset + augmented
+        print(f"  Training set size: {len(current_train_dataset)} samples (original + phase {aug_phase_num} augmentation)")
+
+        train_loader_aug = DataLoader(
+            current_train_dataset, batch_size=CONFIG["batch_size"], shuffle=True
+        )
+
+        # Reset optimizer for this augmentation phase
+        optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG["learning_rate"])
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=5
+        )
+
+        best_val_loss_aug = float("inf")
+
+        for epoch in range(CONFIG["epochs_per_aug_phase"]):
+            train_loss = train_epoch(
+                model, train_loader_aug, optimizer, criterion, device, CONFIG["grad_clip"]
             )
-            print(
-                f"  Epoch {actual_epoch:3d}: loss={val_loss:.4f}{marker}, "
-                f"gap={point.optimality_gap_pct:6.2f}%, acc={point.assignment_accuracy_pct:5.1f}%"
-            )
+            val_loss = evaluate(model, test_loader, criterion, device)
+            scheduler.step(val_loss)
+
+            cumulative_epoch += 1
+
+            if val_loss < best_val_loss_aug:
+                best_val_loss_aug = val_loss
+                marker = " *"
+            else:
+                marker = ""
+
+            # Track convergence
+            if (epoch + 1) % CONFIG["track_every_n_epochs"] == 0 or epoch == CONFIG["epochs_per_aug_phase"] - 1:
+                point = track_convergence(
+                    model, scenario, test_dataset[0], mean_y, std_y, cumulative_epoch, phase_name, tracker,
+                    n_steps=CONFIG["augmentation_n_steps"]
+                )
+                print(
+                    f"  Epoch {cumulative_epoch:3d}: loss={val_loss:.4f}{marker}, "
+                    f"gap={point.optimality_gap_pct:6.2f}%, acc={point.assignment_accuracy_pct:5.1f}%"
+                )
+
+        phase_best_losses.append(best_val_loss_aug)
+        print(f"\n  Phase {aug_phase_num} complete. Best val_loss: {best_val_loss_aug:.4f}")
 
     # ========================================================================
     # Final Report
@@ -517,13 +658,37 @@ def main():
     print(f"  Gap: {history[0].optimality_gap_pct:.2f}%")
     print(f"  Accuracy: {history[0].assignment_accuracy_pct:.1f}%")
     print()
+    print(f"After Phase 1 (epoch {CONFIG['epochs_phase1']}):")
+    # Find phase 1 end point
+    phase1_end = [p for p in history if p.phase == "phase1"][-1]
+    print(f"  Gap: {phase1_end.optimality_gap_pct:.2f}%")
+    print(f"  Accuracy: {phase1_end.assignment_accuracy_pct:.1f}%")
+    print()
+
+    # Show progress for each augmentation phase
+    if CONFIG["n_augmentation_phases"] > 0:
+        print(f"After each augmentation phase:")
+        for aug_num in range(1, CONFIG["n_augmentation_phases"] + 1):
+            phase_name = f"aug{aug_num}"
+            phase_points = [p for p in history if p.phase == phase_name]
+            if phase_points:
+                phase_end = phase_points[-1]
+                print(f"  Phase {aug_num} (epoch {phase_end.epoch}): Gap: {phase_end.optimality_gap_pct:.2f}%, Accuracy: {phase_end.assignment_accuracy_pct:.1f}%")
+        print()
+
     print(f"Final state (epoch {history[-1].epoch}):")
     print(f"  Gap: {history[-1].optimality_gap_pct:.2f}%")
     print(f"  Accuracy: {history[-1].assignment_accuracy_pct:.1f}%")
     print()
-    print(f"Improvement:")
+    print(f"Overall Improvement:")
     print(f"  Gap reduction: {history[0].optimality_gap_pct - history[-1].optimality_gap_pct:.2f} percentage points")
     print(f"  Accuracy gain: {history[-1].assignment_accuracy_pct - history[0].assignment_accuracy_pct:.1f} percentage points")
+    print()
+    print(f"Augmentation Impact:")
+    print(f"  Phase 1 final gap: {phase1_end.optimality_gap_pct:.2f}%")
+    print(f"  Final gap after {CONFIG['n_augmentation_phases']} augmentation phase(s): {history[-1].optimality_gap_pct:.2f}%")
+    augmentation_improvement = phase1_end.optimality_gap_pct - history[-1].optimality_gap_pct
+    print(f"  Total gap reduction from augmentation: {augmentation_improvement:.2f} percentage points")
     print()
 
     # Show convergence trajectory
@@ -537,7 +702,7 @@ def main():
         )
 
     print("\n" + "=" * 80)
-    print("[OK] Validation complete!")
+    print(f"[OK] Validation with {CONFIG['n_augmentation_phases']} augmentation phase(s) complete!")
     print("=" * 80)
 
 

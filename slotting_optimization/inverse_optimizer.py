@@ -207,8 +207,8 @@ def optimize_assignment(
     data: Data,
     mean_y: float,
     std_y: float,
-    n_steps: int = 50,
-    lr: float = 0.5,
+    n_steps: int = None,
+    lr: float = None,
     initial_temp: float = 1.0,
     final_temp: float = 0.01,
     verbose: bool = False,
@@ -224,8 +224,8 @@ def optimize_assignment(
         model: Trained GNN model
         data: Original graph data (sparse assignment edges)
         mean_y, std_y: Normalization params for denormalizing predictions
-        n_steps: Number of optimization steps
-        lr: Learning rate for gradient descent
+        n_steps: Number of optimization steps (auto-scaled if None)
+        lr: Learning rate for gradient descent (auto-scaled if None)
         initial_temp: Starting temperature (higher = softer, better gradients)
         final_temp: Ending temperature (lower = sharper, closer to discrete)
         verbose: Print progress
@@ -241,6 +241,12 @@ def optimize_assignment(
     model.eval()
     n_items = data.n_items
     n_storage = data.n_storage
+
+    # Auto-scale based on problem size if not specified
+    if n_steps is None:
+        n_steps = max(50, n_items * 10)  # Scale with problem size
+    if lr is None:
+        lr = 0.5 / (n_items / 5.0)  # Scale inversely with size
 
     # Get current assignment for comparison
     current_assignment = extract_current_assignment(data)
@@ -283,7 +289,8 @@ def optimize_assignment(
             log_alpha.grad.zero_()
 
         # Sinkhorn to get soft permutation (higher temp = softer = better gradients)
-        soft_assign = sinkhorn(log_alpha, n_iters=20, temperature=temp)
+        sinkhorn_iters = max(20, n_items * 3)  # More iterations for larger matrices
+        soft_assign = sinkhorn(log_alpha, n_iters=sinkhorn_iters, temperature=temp)
 
         # Inject into edge attributes
         edge_attr = inject_soft_assignment(dense_data.edge_attr, soft_assign, edge_info)
@@ -306,7 +313,8 @@ def optimize_assignment(
 
     # Final discretization via Hungarian algorithm
     with torch.no_grad():
-        final_soft = sinkhorn(log_alpha, n_iters=50, temperature=0.01)
+        final_iters = max(50, n_items * 8)
+        final_soft = sinkhorn(log_alpha, n_iters=final_iters, temperature=0.01)
         cost_matrix = -final_soft.numpy()
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         final_assignment = col_ind
