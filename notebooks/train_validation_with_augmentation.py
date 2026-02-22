@@ -27,15 +27,249 @@ from slotting_optimization.validation import (
     generate_frequency_optimal_scenario,
     compute_brute_force_optimal,
     ValidationScenario,
-    ConvergenceTracker,
 )
 from slotting_optimization.gnn_builder import build_graph_3d_sparse
 from slotting_optimization.simulator import Simulator
 from slotting_optimization.inverse_optimizer import (
     optimize_assignment,
     assignment_to_graph_data,
+    extract_current_assignment,
 )
 from slotting_optimization.item_locations import ItemLocations
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional
+
+
+# ============================================================================
+# Candidate Pool Evaluation
+# ============================================================================
+
+
+@dataclass
+class CandidateResult:
+    """Result of evaluating a single candidate solution."""
+    source: str  # "training" or "inverse_opt"
+    assignment: np.ndarray
+    simulated_distance: float
+    gap_to_optimal_pct: float
+
+
+@dataclass
+class PhaseEvaluation:
+    """Results of evaluating the full candidate pool at a phase boundary."""
+    phase: str
+    epoch: int
+
+    # Best overall
+    best_distance: float
+    best_gap_pct: float
+    best_source: str
+    best_assignment: np.ndarray
+
+    # Breakdown by source
+    best_training_distance: float
+    best_training_gap_pct: float
+    best_inverse_opt_distance: float
+    best_inverse_opt_gap_pct: float
+
+    # Stats
+    n_training_candidates: int
+    n_inverse_opt_candidates: int
+
+
+def get_gnn_predictions(model, dataset: list, mean_y: float, std_y: float) -> List[float]:
+    """Get GNN predictions for all samples in dataset.
+
+    Returns list of predicted distances (denormalized).
+    """
+    model.eval()
+    predictions = []
+
+    with torch.no_grad():
+        for data in dataset:
+            pred_norm = model(data)
+            pred = pred_norm.item() * std_y + mean_y
+            predictions.append(pred)
+
+    return predictions
+
+
+def simulate_assignment(
+    assignment: np.ndarray,
+    raw_sample: tuple,  # (OrderBook, ItemLocations, Warehouse)
+    simulator: Simulator,
+) -> float:
+    """Simulate a single assignment and return the distance."""
+    order_book, original_il, warehouse = raw_sample
+
+    # Get item IDs (sorted to match graph node order)
+    items = sorted(original_il.to_dict().keys())
+
+    # Get storage locations
+    storage_locs = sorted([
+        loc for loc in warehouse.locations()
+        if loc not in (warehouse.start_point, warehouse.end_point)
+    ])
+
+    # Build ItemLocations with the assignment
+    records = []
+    for i, item in enumerate(items):
+        loc_idx = assignment[i]
+        records.append({"item_id": item, "location_id": storage_locs[loc_idx]})
+
+    il = ItemLocations.from_records(records)
+    distance, _ = simulator.simulate(order_book, warehouse, il)
+    return distance
+
+
+def evaluate_candidate_pool(
+    model: nn.Module,
+    accumulated_dataset: list,  # All training samples (original + augmented)
+    raw_samples: list,  # Raw samples for simulation (first N correspond to original training)
+    scenario: "ValidationScenario",
+    mean_y: float,
+    std_y: float,
+    n_top_for_inverse_opt: int = 10,
+    n_steps: int = 50,
+    phase: str = "phase1",
+    epoch: int = 0,
+) -> PhaseEvaluation:
+    """Evaluate the full candidate pool at a phase boundary.
+
+    Candidate pool consists of:
+    1. All accumulated training samples (original + augmented from previous phases)
+    2. Top N samples by GNN prediction → inverse optimized → N new candidates
+
+    Each candidate is simulated to get its true distance.
+
+    Args:
+        model: Trained GNN model
+        accumulated_dataset: All training Data objects accumulated so far
+        raw_samples: Raw (OrderBook, ItemLocations, Warehouse) tuples for first N samples
+        scenario: ValidationScenario with optimal solution
+        mean_y, std_y: Normalization params
+        n_top_for_inverse_opt: How many top samples to inverse optimize
+        n_steps: Optimization steps for inverse optimization
+        phase: Phase name for reporting
+        epoch: Current epoch for reporting
+
+    Returns:
+        PhaseEvaluation with detailed breakdown
+    """
+    model.eval()
+    simulator = Simulator()
+    optimal_distance = scenario.optimal_distance
+
+    results_training = []
+    results_inverse_opt = []
+
+    # ------------------------------------------------------------------
+    # 1. Evaluate all accumulated training samples
+    # ------------------------------------------------------------------
+    print(f"    Evaluating {len(accumulated_dataset)} training candidates...")
+
+    for idx, data in enumerate(accumulated_dataset):
+        # Extract assignment from graph
+        assignment = extract_current_assignment(data)
+
+        # Simulate - we need a raw_sample for this
+        # For samples beyond original training set (augmented), we use the first raw_sample
+        # since they all share the same order_book/warehouse
+        raw_idx = min(idx, len(raw_samples) - 1)
+        distance = simulate_assignment(assignment, raw_samples[raw_idx], simulator)
+
+        gap_pct = (distance - optimal_distance) / optimal_distance * 100
+
+        results_training.append(CandidateResult(
+            source="training",
+            assignment=assignment,
+            simulated_distance=distance,
+            gap_to_optimal_pct=gap_pct,
+        ))
+
+    # ------------------------------------------------------------------
+    # 2. Get GNN predictions and select top N for inverse optimization
+    # ------------------------------------------------------------------
+    print(f"    Selecting top {n_top_for_inverse_opt} by GNN prediction for inverse optimization...")
+
+    predictions = get_gnn_predictions(model, accumulated_dataset, mean_y, std_y)
+
+    # Sort indices by prediction (ascending - lower is better)
+    sorted_indices = np.argsort(predictions)
+    top_indices = sorted_indices[:n_top_for_inverse_opt]
+
+    # ------------------------------------------------------------------
+    # 3. Inverse optimize top N and simulate
+    # ------------------------------------------------------------------
+    print(f"    Inverse optimizing top {len(top_indices)} candidates...")
+
+    for idx in top_indices:
+        data = accumulated_dataset[idx]
+        raw_idx = min(idx, len(raw_samples) - 1)
+        raw_sample = raw_samples[raw_idx]
+
+        # Run inverse optimization
+        result = optimize_assignment(
+            model=model,
+            data=data,
+            mean_y=mean_y,
+            std_y=std_y,
+            n_steps=n_steps,
+            verbose=False,
+        )
+
+        optimized_assignment = result["optimized_assignment"]
+
+        # Simulate the optimized assignment
+        distance = simulate_assignment(optimized_assignment, raw_sample, simulator)
+        gap_pct = (distance - optimal_distance) / optimal_distance * 100
+
+        results_inverse_opt.append(CandidateResult(
+            source="inverse_opt",
+            assignment=optimized_assignment,
+            simulated_distance=distance,
+            gap_to_optimal_pct=gap_pct,
+        ))
+
+    # ------------------------------------------------------------------
+    # 4. Compute best results
+    # ------------------------------------------------------------------
+    best_training = min(results_training, key=lambda r: r.simulated_distance)
+    best_inverse = min(results_inverse_opt, key=lambda r: r.simulated_distance) if results_inverse_opt else None
+
+    # Overall best
+    all_results = results_training + results_inverse_opt
+    best_overall = min(all_results, key=lambda r: r.simulated_distance)
+
+    return PhaseEvaluation(
+        phase=phase,
+        epoch=epoch,
+        best_distance=best_overall.simulated_distance,
+        best_gap_pct=best_overall.gap_to_optimal_pct,
+        best_source=best_overall.source,
+        best_assignment=best_overall.assignment,
+        best_training_distance=best_training.simulated_distance,
+        best_training_gap_pct=best_training.gap_to_optimal_pct,
+        best_inverse_opt_distance=best_inverse.simulated_distance if best_inverse else float('inf'),
+        best_inverse_opt_gap_pct=best_inverse.gap_to_optimal_pct if best_inverse else float('inf'),
+        n_training_candidates=len(results_training),
+        n_inverse_opt_candidates=len(results_inverse_opt),
+    )
+
+
+def print_phase_evaluation(eval_result: PhaseEvaluation, optimal_distance: float):
+    """Print a detailed breakdown of phase evaluation results."""
+    print(f"\n    {'='*60}")
+    print(f"    PHASE EVALUATION: {eval_result.phase} (epoch {eval_result.epoch})")
+    print(f"    {'='*60}")
+    print(f"    Optimal distance: {optimal_distance:.2f}")
+    print(f"    Candidates: {eval_result.n_training_candidates} training + {eval_result.n_inverse_opt_candidates} inverse-opt")
+    print()
+    print(f"    Best from training:    {eval_result.best_training_distance:.2f} (gap: {eval_result.best_training_gap_pct:+.2f}%)")
+    print(f"    Best from inverse-opt: {eval_result.best_inverse_opt_distance:.2f} (gap: {eval_result.best_inverse_opt_gap_pct:+.2f}%)")
+    print()
+    print(f"    >>> BEST OVERALL: {eval_result.best_distance:.2f} (gap: {eval_result.best_gap_pct:+.2f}%) from {eval_result.best_source}")
+    print(f"    {'='*60}")
 
 
 # ============================================================================
@@ -181,7 +415,7 @@ def get_config_for_problem_size(n_items: int) -> dict:
         "n_locations": n_items,
         "n_items": n_items,
         "n_orders": max(100, n_items * 20),  # More orders for richer signal
-        "n_samples": 500,
+        "n_samples": 100,
         "train_split": 0.8,
         "seed": 42,
         "hidden_dim": 32,
@@ -189,8 +423,8 @@ def get_config_for_problem_size(n_items: int) -> dict:
         "batch_size": 32,
         "grad_clip": 1.0,
         "track_every_n_epochs": 5,
-        "max_augmented_samples": 250,
         "n_augmentation_phases": 5,  # Number of augmentation cycles to run
+        "n_top_for_inverse_opt": 10,  # Top N by GNN prediction to inverse optimize
     }
 
     # Complexity scales roughly with search space size (n!)
@@ -214,7 +448,7 @@ def get_config_for_problem_size(n_items: int) -> dict:
 # To run longer training with multiple augmentation cycles, modify:
 #   CONFIG["n_augmentation_phases"] = 3  # Run 3 augmentation cycles instead of 1
 #   CONFIG["epochs_per_aug_phase"] = 30  # More epochs per phase
-CONFIG = get_config_for_problem_size(5)
+CONFIG = get_config_for_problem_size(8)
 
 
 def train_epoch(model, train_loader, optimizer, criterion, device, grad_clip):
@@ -254,32 +488,6 @@ def evaluate(model, test_loader, criterion, device):
     return total_loss / n_samples
 
 
-def track_convergence(
-    model, scenario, test_data, mean_y, std_y, epoch, phase, tracker, n_steps=None
-):
-    """Track convergence at current epoch."""
-    model.eval()
-
-    # Run inverse optimization on a test sample
-    result = optimize_assignment(
-        model=model,
-        data=test_data,
-        mean_y=mean_y,
-        std_y=std_y,
-        n_steps=n_steps,
-        verbose=False,
-    )
-
-    # Record convergence point
-    point = tracker.record(
-        epoch=epoch,
-        phase=phase,
-        optimized_assignment=result["optimized_assignment"],
-    )
-
-    return point
-
-
 def augment_dataset(
     model,
     train_dataset,
@@ -289,12 +497,12 @@ def augment_dataset(
     edge_mean,
     edge_std,
     n_steps: int = 50,
-    max_samples: int = None,
+    n_top: int = 10,
 ) -> list:
-    """Generate one optimized sample per training sample.
+    """Generate augmented samples by inverse optimizing top N samples by GNN prediction.
 
     Uses single-run gradient-based optimization (like CNN activation maximization)
-    to find an improved assignment for each training sample.
+    to find an improved assignment for each selected sample.
 
     Args:
         model: Trained GNN model
@@ -303,7 +511,7 @@ def augment_dataset(
         mean_y, std_y: Target normalization params
         edge_mean, edge_std: Edge attribute normalization params
         n_steps: Number of optimization steps per sample
-        max_samples: Stop generating after this many samples (None = no limit)
+        n_top: Select top N samples by GNN prediction (lowest predicted distance)
 
     Returns:
         List of augmented Data objects (normalized)
@@ -312,20 +520,18 @@ def augment_dataset(
     simulator = Simulator()
     augmented = []
 
-    n_to_process = len(train_dataset)
-    if max_samples is not None:
-        n_to_process = min(n_to_process, max_samples)
+    # Get GNN predictions for all samples
+    predictions = get_gnn_predictions(model, train_dataset, mean_y, std_y)
 
-    for idx, (data, raw_sample) in enumerate(
-        tqdm(
-            zip(train_dataset, raw_train_samples),
-            desc="  Augmenting",
-            total=n_to_process,
-        )
-    ):
-        # Check if we've reached the limit
-        if max_samples is not None and len(augmented) >= max_samples:
-            break
+    # Sort indices by prediction (ascending - lower distance = better)
+    sorted_indices = np.argsort(predictions)
+    top_indices = sorted_indices[:n_top]
+
+    print(f"  Selected top {len(top_indices)} samples by GNN prediction for inverse optimization")
+
+    for idx in tqdm(top_indices, desc="  Augmenting"):
+        data = train_dataset[idx]
+        raw_sample = raw_train_samples[idx]
 
         # Single optimization run (like CNN activation maximization)
         result = optimize_assignment(
@@ -358,7 +564,7 @@ def main():
     print("=" * 80)
     print(f"Problem: {CONFIG['n_items']} items, {CONFIG['n_locations']} locations")
     print(f"Training samples: {CONFIG['n_samples']} (different random starting assignments)")
-    print(f"Augmentation: {CONFIG['n_augmentation_phases']} phase(s), up to {CONFIG['max_augmented_samples']} samples per phase")
+    print(f"Augmentation: {CONFIG['n_augmentation_phases']} phase(s), top {CONFIG['n_top_for_inverse_opt']} by GNN prediction per phase")
     print(f"Tracking every {CONFIG['track_every_n_epochs']} epochs")
     total_epochs = CONFIG['epochs_phase1'] + CONFIG['n_augmentation_phases'] * CONFIG['epochs_per_aug_phase']
     print(f"Total training epochs: {total_epochs}")
@@ -505,24 +711,36 @@ def main():
         test_dataset, batch_size=CONFIG["batch_size"], shuffle=False
     )
 
-    # Initialize convergence tracker
-    tracker = ConvergenceTracker(scenario)
+    # ========================================================================
+    # Track phase evaluations (candidate pool evaluation at each phase boundary)
+    # ========================================================================
+    phase_evaluations: List[PhaseEvaluation] = []
+    best_solution_ever: Optional[PhaseEvaluation] = None
 
     # ========================================================================
-    # Phase 1: Initial Training with Convergence Tracking
+    # Phase 1: Initial Training
     # ========================================================================
     print("\n[5/8] Phase 1: Initial training...")
 
     best_val_loss = float("inf")
 
-    # Track initial convergence (epoch 0)
-    print("  Tracking convergence at epoch 0...")
-    point = track_convergence(
-        model, scenario, test_dataset[0], mean_y, std_y, 0, "phase1", tracker,
-        n_steps=CONFIG["augmentation_n_steps"]
+    # Initial evaluation before training (epoch 0)
+    print("  Evaluating candidate pool at epoch 0 (before training)...")
+    eval_result = evaluate_candidate_pool(
+        model=model,
+        accumulated_dataset=train_dataset,
+        raw_samples=raw_train_samples,
+        scenario=scenario,
+        mean_y=mean_y,
+        std_y=std_y,
+        n_top_for_inverse_opt=CONFIG["n_top_for_inverse_opt"],
+        n_steps=CONFIG["augmentation_n_steps"],
+        phase="phase1_start",
+        epoch=0,
     )
-    print(f"    Gap: {point.optimality_gap_pct:.2f}%, Accuracy: {point.assignment_accuracy_pct:.1f}%")
-    print(f"    Using {CONFIG['augmentation_n_steps']} optimization steps, LR scaled for {CONFIG['n_items']}x{CONFIG['n_items']}")
+    phase_evaluations.append(eval_result)
+    best_solution_ever = eval_result
+    print_phase_evaluation(eval_result, scenario.optimal_distance)
 
     for epoch in range(CONFIG["epochs_phase1"]):
         train_loss = train_epoch(
@@ -537,18 +755,29 @@ def main():
         else:
             marker = ""
 
-        # Track convergence
+        # Print progress every N epochs
         if (epoch + 1) % CONFIG["track_every_n_epochs"] == 0 or epoch == CONFIG["epochs_phase1"] - 1:
-            point = track_convergence(
-                model, scenario, test_dataset[0], mean_y, std_y, epoch + 1, "phase1", tracker,
-                n_steps=CONFIG["augmentation_n_steps"]
-            )
-            print(
-                f"  Epoch {epoch + 1:3d}: loss={val_loss:.4f}{marker}, "
-                f"gap={point.optimality_gap_pct:6.2f}%, acc={point.assignment_accuracy_pct:5.1f}%"
-            )
+            print(f"  Epoch {epoch + 1:3d}: loss={val_loss:.4f}{marker}")
 
+    # Evaluate candidate pool at end of Phase 1
     print(f"\n  Phase 1 complete. Best val_loss: {best_val_loss:.4f}")
+    print("  Evaluating candidate pool at end of Phase 1...")
+    eval_result = evaluate_candidate_pool(
+        model=model,
+        accumulated_dataset=train_dataset,
+        raw_samples=raw_train_samples,
+        scenario=scenario,
+        mean_y=mean_y,
+        std_y=std_y,
+        n_top_for_inverse_opt=CONFIG["n_top_for_inverse_opt"],
+        n_steps=CONFIG["augmentation_n_steps"],
+        phase="phase1_end",
+        epoch=CONFIG["epochs_phase1"],
+    )
+    phase_evaluations.append(eval_result)
+    if eval_result.best_gap_pct < best_solution_ever.best_gap_pct:
+        best_solution_ever = eval_result
+    print_phase_evaluation(eval_result, scenario.optimal_distance)
 
     # ========================================================================
     # Phases 2+: Iterative Augmentation Cycles
@@ -556,7 +785,7 @@ def main():
     # Each cycle: generate augmented samples → train on combined dataset
     # This allows the model to iteratively improve via self-generated data
 
-    current_train_dataset = train_dataset
+    current_train_dataset = list(train_dataset)  # Copy to avoid modifying original
     cumulative_epoch = CONFIG["epochs_phase1"]
     phase_best_losses = []
 
@@ -568,7 +797,7 @@ def main():
         # The train_dataset was normalized in-place, so we rebuild for augmentation
         print("  Rebuilding unnormalized training graphs for augmentation...")
         aug_train_graphs = []
-        for ob, il, w in tqdm(raw_train_samples[:CONFIG["max_augmented_samples"]], desc="  Rebuilding"):
+        for ob, il, w in tqdm(raw_train_samples, desc="  Rebuilding"):
             g_data = build_graph_3d_sparse(
                 order_book=ob,
                 item_locations=il,
@@ -582,13 +811,13 @@ def main():
         augmented = augment_dataset(
             model=model,
             train_dataset=aug_train_graphs,
-            raw_train_samples=raw_train_samples[:CONFIG["max_augmented_samples"]],
+            raw_train_samples=raw_train_samples,
             mean_y=mean_y,
             std_y=std_y,
             edge_mean=edge_mean,
             edge_std=edge_std,
             n_steps=CONFIG["augmentation_n_steps"],
-            max_samples=CONFIG["max_augmented_samples"],
+            n_top=CONFIG["n_top_for_inverse_opt"],
         )
 
         print(f"  Generated {len(augmented)} augmented samples")
@@ -629,80 +858,111 @@ def main():
             else:
                 marker = ""
 
-            # Track convergence
+            # Print progress every N epochs
             if (epoch + 1) % CONFIG["track_every_n_epochs"] == 0 or epoch == CONFIG["epochs_per_aug_phase"] - 1:
-                point = track_convergence(
-                    model, scenario, test_dataset[0], mean_y, std_y, cumulative_epoch, phase_name, tracker,
-                    n_steps=CONFIG["augmentation_n_steps"]
-                )
-                print(
-                    f"  Epoch {cumulative_epoch:3d}: loss={val_loss:.4f}{marker}, "
-                    f"gap={point.optimality_gap_pct:6.2f}%, acc={point.assignment_accuracy_pct:5.1f}%"
-                )
+                print(f"  Epoch {cumulative_epoch:3d}: loss={val_loss:.4f}{marker}")
 
         phase_best_losses.append(best_val_loss_aug)
         print(f"\n  Phase {aug_phase_num} complete. Best val_loss: {best_val_loss_aug:.4f}")
+
+        # Evaluate candidate pool at end of this augmentation phase
+        print(f"  Evaluating candidate pool at end of augmentation phase {aug_phase_num}...")
+        eval_result = evaluate_candidate_pool(
+            model=model,
+            accumulated_dataset=current_train_dataset,
+            raw_samples=raw_train_samples,
+            scenario=scenario,
+            mean_y=mean_y,
+            std_y=std_y,
+            n_top_for_inverse_opt=CONFIG["n_top_for_inverse_opt"],
+            n_steps=CONFIG["augmentation_n_steps"],
+            phase=f"aug{aug_phase_num}_end",
+            epoch=cumulative_epoch,
+        )
+        phase_evaluations.append(eval_result)
+        if eval_result.best_gap_pct < best_solution_ever.best_gap_pct:
+            best_solution_ever = eval_result
+        print_phase_evaluation(eval_result, scenario.optimal_distance)
 
     # ========================================================================
     # Final Report
     # ========================================================================
     print("\n" + "=" * 80)
-    print("CONVERGENCE REPORT")
+    print("CONVERGENCE REPORT - CANDIDATE POOL EVALUATION")
     print("=" * 80)
 
-    history = tracker.get_history()
-
-    print(f"Optimal distance: {scenario.optimal_distance:.2f}")
-    print()
-    print(f"Initial state (epoch 0):")
-    print(f"  Gap: {history[0].optimality_gap_pct:.2f}%")
-    print(f"  Accuracy: {history[0].assignment_accuracy_pct:.1f}%")
-    print()
-    print(f"After Phase 1 (epoch {CONFIG['epochs_phase1']}):")
-    # Find phase 1 end point
-    phase1_end = [p for p in history if p.phase == "phase1"][-1]
-    print(f"  Gap: {phase1_end.optimality_gap_pct:.2f}%")
-    print(f"  Accuracy: {phase1_end.assignment_accuracy_pct:.1f}%")
+    print(f"\nOptimal distance (brute force verified): {scenario.optimal_distance:.2f}")
     print()
 
-    # Show progress for each augmentation phase
-    if CONFIG["n_augmentation_phases"] > 0:
-        print(f"After each augmentation phase:")
-        for aug_num in range(1, CONFIG["n_augmentation_phases"] + 1):
-            phase_name = f"aug{aug_num}"
-            phase_points = [p for p in history if p.phase == phase_name]
-            if phase_points:
-                phase_end = phase_points[-1]
-                print(f"  Phase {aug_num} (epoch {phase_end.epoch}): Gap: {phase_end.optimality_gap_pct:.2f}%, Accuracy: {phase_end.assignment_accuracy_pct:.1f}%")
-        print()
-
-    print(f"Final state (epoch {history[-1].epoch}):")
-    print(f"  Gap: {history[-1].optimality_gap_pct:.2f}%")
-    print(f"  Accuracy: {history[-1].assignment_accuracy_pct:.1f}%")
-    print()
-    print(f"Overall Improvement:")
-    print(f"  Gap reduction: {history[0].optimality_gap_pct - history[-1].optimality_gap_pct:.2f} percentage points")
-    print(f"  Accuracy gain: {history[-1].assignment_accuracy_pct - history[0].assignment_accuracy_pct:.1f} percentage points")
-    print()
-    print(f"Augmentation Impact:")
-    print(f"  Phase 1 final gap: {phase1_end.optimality_gap_pct:.2f}%")
-    print(f"  Final gap after {CONFIG['n_augmentation_phases']} augmentation phase(s): {history[-1].optimality_gap_pct:.2f}%")
-    augmentation_improvement = phase1_end.optimality_gap_pct - history[-1].optimality_gap_pct
-    print(f"  Total gap reduction from augmentation: {augmentation_improvement:.2f} percentage points")
+    # Summary of best solution found
+    print("=" * 60)
+    print("BEST SOLUTION FOUND")
+    print("=" * 60)
+    print(f"  Distance: {best_solution_ever.best_distance:.2f}")
+    print(f"  Gap to optimal: {best_solution_ever.best_gap_pct:+.2f}%")
+    print(f"  Source: {best_solution_ever.best_source}")
+    print(f"  Found at: {best_solution_ever.phase} (epoch {best_solution_ever.epoch})")
     print()
 
-    # Show convergence trajectory
-    print("Convergence trajectory:")
-    print(f"{'Epoch':>6} {'Phase':>8} {'Gap (%)':>10} {'Accuracy (%)':>14}")
-    print("-" * 42)
-    for point in history:
+    # Trajectory table
+    print("=" * 60)
+    print("CANDIDATE POOL TRAJECTORY")
+    print("=" * 60)
+    print(f"{'Phase':<15} {'Epoch':>6} {'Best Gap':>10} {'Training':>12} {'Inv-Opt':>12} {'Source':>12}")
+    print("-" * 70)
+    for ev in phase_evaluations:
         print(
-            f"{point.epoch:6d} {point.phase:>8} "
-            f"{point.optimality_gap_pct:10.2f} {point.assignment_accuracy_pct:14.1f}"
+            f"{ev.phase:<15} {ev.epoch:>6} {ev.best_gap_pct:>+9.2f}% "
+            f"{ev.best_training_gap_pct:>+11.2f}% {ev.best_inverse_opt_gap_pct:>+11.2f}% "
+            f"{ev.best_source:>12}"
         )
+    print()
 
-    print("\n" + "=" * 80)
+    # Improvement analysis
+    initial_eval = phase_evaluations[0]
+    final_eval = phase_evaluations[-1]
+
+    print("=" * 60)
+    print("IMPROVEMENT ANALYSIS")
+    print("=" * 60)
+    print(f"Initial best gap (before training): {initial_eval.best_gap_pct:+.2f}%")
+    print(f"Final best gap (after all phases): {final_eval.best_gap_pct:+.2f}%")
+    print(f"Total gap reduction: {initial_eval.best_gap_pct - final_eval.best_gap_pct:.2f} percentage points")
+    print()
+
+    # Phase 1 vs augmentation impact
+    phase1_end_eval = [ev for ev in phase_evaluations if ev.phase == "phase1_end"][0]
+    print(f"After Phase 1: {phase1_end_eval.best_gap_pct:+.2f}%")
+
+    if CONFIG["n_augmentation_phases"] > 0:
+        aug_reduction = phase1_end_eval.best_gap_pct - final_eval.best_gap_pct
+        print(f"Augmentation impact: {aug_reduction:.2f} percentage points additional reduction")
+    print()
+
+    # Breakdown by source
+    print("=" * 60)
+    print("SOURCE ANALYSIS")
+    print("=" * 60)
+    training_wins = sum(1 for ev in phase_evaluations if ev.best_source == "training")
+    inv_opt_wins = sum(1 for ev in phase_evaluations if ev.best_source == "inverse_opt")
+    print(f"Best solution from training set: {training_wins} times")
+    print(f"Best solution from inverse optimization: {inv_opt_wins} times")
+    print()
+
+    # Dataset growth
+    print("=" * 60)
+    print("DATASET GROWTH")
+    print("=" * 60)
+    for ev in phase_evaluations:
+        print(f"  {ev.phase}: {ev.n_training_candidates} training + {ev.n_inverse_opt_candidates} inverse-opt candidates")
+    print()
+
+    print("=" * 80)
     print(f"[OK] Validation with {CONFIG['n_augmentation_phases']} augmentation phase(s) complete!")
+    if best_solution_ever.best_gap_pct <= 0:
+        print("[SUCCESS] Found optimal solution!")
+    else:
+        print(f"[INFO] Best gap to optimal: {best_solution_ever.best_gap_pct:+.2f}%")
     print("=" * 80)
 
 
