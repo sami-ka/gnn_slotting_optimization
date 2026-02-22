@@ -33,15 +33,21 @@ def compute_brute_force_optimal(
     if len(items) != len(storage_locations):
         raise ValueError(f"Number of items ({len(items)}) must equal number of locations ({len(storage_locations)})")
 
-    if len(items) > 8:
-        raise ValueError(f"Brute force only supports up to 8 items (got {len(items)}). Use heuristic methods for larger problems.")
+    if len(items) > 10:
+        raise ValueError(f"Brute force only supports up to 10 items (got {len(items)}). Use heuristic methods for larger problems.")
 
     simulator = Simulator()
     best_distance = float('inf')
     best_assignment = None
 
+    max_count = 50_000
     # Enumerate all permutations
+    count = 0
     for perm in permutations(storage_locations):
+        if count >= max_count:
+            print(f"Reached max permutation count ({max_count}). Stopping enumeration.")
+            break
+        count += 1
         assignment_dict = {item: loc for item, loc in zip(items, perm)}
         assignment = ItemLocations.from_records([
             {"item_id": item, "location_id": loc}
