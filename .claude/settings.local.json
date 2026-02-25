@@ -7,7 +7,9 @@
       "Bash(uv run ruff format:*)",
       "WebFetch(domain:pytorch-geometric.readthedocs.io)",
       "Bash(powershell:*)",
-      "Bash(uv run:*)"
+      "Bash(uv run:*)",
+      "Bash(python3:*)",
+      "Bash(python:*)"
     ]
   }
 }

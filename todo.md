@@ -1,5 +1,5 @@
-- look why 250 samples are added each time instead of 10 (top 10GNN predictions)
-- use the new way of generating orderbook
-- need to have some diversity in what we add to the dataset
-- iterate
+- Look at the scripts that load the instances and run it
+- understand why the distance of the simulator is not the same 
+- make changes to the simulator so that we have a matching warehouse. Maybe by providing a custom function that computes the distance for these instances but following the protocol
+
 
