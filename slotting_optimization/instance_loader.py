@@ -144,6 +144,8 @@ def load_l17_instance(layout_dir: str, instance_name: str) -> dict:
         .get("Best known objective", "0")
     )
     best_objective = float(best_obj_str)
+    num_vehicles = instance["NUM_VEHICLES"]
+    vehicle_capacity = instance["CAPACITIES"]
 
     return {
         "warehouse": warehouse,
@@ -154,7 +156,18 @@ def load_l17_instance(layout_dir: str, instance_name: str) -> dict:
         "items": all_skus,
         "storage_locations": storage_ids,
         "best_objective": best_objective,
+        "num_vehicles": num_vehicles,
+        "vehicle_capacity": vehicle_capacity,
     }
+
+
+def load_single_vehicle_instances(layout_dir: str) -> List[dict]:
+    """Load instances with exactly one vehicle from a layout directory.
+
+    Returns list of dicts (same format as ``load_l17_instance``) filtered to
+    those where ``num_vehicles == 1``.
+    """
+    return [r for r in load_all_instances(layout_dir) if r["num_vehicles"] == 1]
 
 
 def load_all_instances(layout_dir: str) -> List[dict]:

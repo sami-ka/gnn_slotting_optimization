@@ -6,6 +6,7 @@ import pytest
 from slotting_optimization.instance_loader import (
     load_l17_instance,
     load_all_instances,
+    load_single_vehicle_instances,
     get_storage_location_ids,
 )
 from slotting_optimization.simulator import Simulator
@@ -98,6 +99,24 @@ def test_warehouse_distances_symmetric(instance):
                 d2 = w.get_distance(b, a)
                 assert d1 is not None
                 assert d1 == d2
+
+
+def test_instance_has_num_vehicles(instance):
+    assert isinstance(instance["num_vehicles"], int)
+    assert instance["num_vehicles"] > 0
+
+
+def test_instance_has_vehicle_capacity(instance):
+    assert isinstance(instance["vehicle_capacity"], int)
+    assert instance["vehicle_capacity"] > 0
+    assert instance["vehicle_capacity"] == 3
+
+
+def test_load_single_vehicle_instances():
+    results = load_single_vehicle_instances(LAYOUT_DIR)
+    assert len(results) > 0
+    for r in results:
+        assert r["num_vehicles"] == 1
 
 
 def test_get_storage_location_ids():

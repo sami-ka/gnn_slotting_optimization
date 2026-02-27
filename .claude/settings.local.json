@@ -9,7 +9,11 @@
       "Bash(powershell:*)",
       "Bash(uv run:*)",
       "Bash(python3:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(wc:*)",
+      "Bash(ls:*)",
+      "Bash(head:*)",
+      "Bash(sed:*)"
     ]
   }
 }

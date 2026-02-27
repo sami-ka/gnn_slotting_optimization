@@ -32,7 +32,7 @@ import random
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from slotting_optimization.instance_loader import load_l17_instance
+from slotting_optimization.instance_loader import load_l17_instance, load_single_vehicle_instances
 from slotting_optimization.gnn_builder import build_graph_3d_sparse
 from slotting_optimization.simulator import Simulator
 from slotting_optimization.inverse_optimizer import (
@@ -399,7 +399,6 @@ def main():
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "L17_533", "Conventional",
     )
-    INSTANCE_NAME = "c10_8502"  # Small instance (10 picks, 1 SKU to slot)
 
     print("=" * 80)
     print("L17_533 INSTANCE TRAINING")
@@ -408,9 +407,15 @@ def main():
     # ========================================================================
     # Load Instance
     # ========================================================================
-    print(f"\n[1/8] Loading instance {INSTANCE_NAME}...")
+    print("\n[1/8] Loading single-vehicle instances...")
 
-    data = load_l17_instance(LAYOUT_DIR, INSTANCE_NAME)
+    all_instances = load_single_vehicle_instances(LAYOUT_DIR)
+    print(f"  Found {len(all_instances)} single-vehicle instances")
+
+    # Use first instance for training (smallest/simplest)
+    data = all_instances[0]
+    INSTANCE_NAME = data.get("instance_name", "unknown")
+
     warehouse = data["warehouse"]
     order_book = data["order_book"]
     item_locations = data["item_locations"]
@@ -424,6 +429,7 @@ def main():
     print(f"  Orders (picks): {len(order_book)}")
     print(f"  SKUs to slot: {len(skus_to_slot)} ({skus_to_slot})")
     print(f"  Fixed assignments: {len(item_locations)}")
+    print(f"  Vehicle capacity: {data['vehicle_capacity']}")
     print(f"  Best known objective (benchmark routing): {best_objective}")
 
     # Compute our simulator's distance for the solution
@@ -441,7 +447,7 @@ def main():
 
     # Create ValidationScenario using solution as optimal
     scenario = ValidationScenario(
-        name=f"l17_{INSTANCE_NAME}",
+        name="l17_single_vehicle",
         order_book=order_book,
         warehouse=warehouse,
         initial_assignment=item_locations,
@@ -647,7 +653,7 @@ def main():
     print("\n" + "=" * 80)
     print("CONVERGENCE REPORT")
     print("=" * 80)
-    print(f"\nInstance: {INSTANCE_NAME}")
+    print(f"\nInstances: {len(all_instances)} single-vehicle")
     print(f"Benchmark best objective (TSP routing): {best_objective}")
     print(f"Solution distance (our routing): {scenario.optimal_distance:.2f}")
     print()
