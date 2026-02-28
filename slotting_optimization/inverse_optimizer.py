@@ -213,6 +213,7 @@ def optimize_assignment(
     final_temp: float = 0.01,
     verbose: bool = False,
     perturbation_scale: float = 0.0,
+    device: str = "cpu",
 ) -> Dict[str, Any]:
     """Single-run gradient-based assignment optimization.
 
@@ -255,20 +256,24 @@ def optimize_assignment(
     # Create dense graph for optimization
     dense_data, edge_info = create_dense_assignment_graph(data, n_items, n_storage)
 
+    # Move dense graph data to device
+    dense_data.edge_index = dense_data.edge_index.to(device)
+    dense_data.edge_attr = dense_data.edge_attr.to(device)
+
     # Initialize assignment logits from current assignment (smaller bias for exploration)
-    log_alpha = torch.zeros(n_items, n_storage, requires_grad=True)
+    log_alpha = torch.zeros(n_items, n_storage, device=device, requires_grad=True)
     for item_idx, loc_idx in enumerate(current_assignment):
         log_alpha.data[item_idx, loc_idx] = 1.0
     if perturbation_scale > 0:
-        log_alpha.data += torch.randn(n_items, n_storage) * perturbation_scale
+        log_alpha.data += torch.randn(n_items, n_storage, device=device) * perturbation_scale
 
     # Compute node features from node embedding (same as training)
     nodes_per_graph = n_items + data.n_locs
-    node_ids = torch.arange(dense_data.num_nodes) % nodes_per_graph
+    node_ids = torch.arange(dense_data.num_nodes, device=device) % nodes_per_graph
     x = model.node_embedding(node_ids).detach()
 
     # Score original assignment first
-    original_soft = torch.zeros(n_items, n_storage)
+    original_soft = torch.zeros(n_items, n_storage, device=device)
     for item_idx, loc_idx in enumerate(current_assignment):
         original_soft[item_idx, loc_idx] = 1.0
     original_edge_attr = inject_soft_assignment(
@@ -318,12 +323,12 @@ def optimize_assignment(
     with torch.no_grad():
         final_iters = max(50, n_items * 8)
         final_soft = sinkhorn(log_alpha, n_iters=final_iters, temperature=0.01)
-        cost_matrix = -final_soft.numpy()
+        cost_matrix = -final_soft.cpu().numpy()
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         final_assignment = col_ind
 
     # Score final discrete assignment
-    final_hard = torch.zeros(n_items, n_storage)
+    final_hard = torch.zeros(n_items, n_storage, device=device)
     for item_idx, loc_idx in enumerate(final_assignment):
         final_hard[item_idx, loc_idx] = 1.0
     final_edge_attr = inject_soft_assignment(
