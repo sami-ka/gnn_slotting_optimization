@@ -566,6 +566,7 @@ def augment_dataset(
         precompute_node_features(graph_data)
         if x_mean is not None and x_std is not None:
             graph_data.x = (graph_data.x - x_mean) / (x_std + 1e-8)
+        graph_data = graph_data.cpu()
         augmented.append(graph_data)
         augmented_raw_and_graph.append((raw_sample, graph_data))
     print(f"  Generated {len(augmented)} augmented samples ({n_duplicates} duplicates skipped)")
