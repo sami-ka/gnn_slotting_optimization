@@ -386,7 +386,7 @@ def get_config_for_instance(n_items: int, n_locations: int) -> dict:
     return {
         "n_items": n_items,
         "n_locations": n_locations,
-        "n_samples": 200,
+        "n_samples": 30,
         "train_split": 0.8,
         "seed": 42,
         "hidden_dim": 32,
@@ -398,7 +398,7 @@ def get_config_for_instance(n_items: int, n_locations: int) -> dict:
         "epochs_per_aug_phase": max(20, int(5 * complexity_ratio)),
         "learning_rate": 0.001,
         "n_augmentation_phases": 5,
-        "n_top_for_inverse_opt": 15,
+        "n_top_for_inverse_opt": 5,
         "perturbation_scale": 1.0,
         "augmentation_n_steps": max(50, n_items * 10),
     }
