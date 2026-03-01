@@ -118,17 +118,18 @@ def create_dense_assignment_graph(data: Data, n_items: int, n_storage: int):
             item_indices.append(item_idx)
             loc_indices.append(n_items + loc_idx)
 
-    new_item_loc_edges = torch.tensor([item_indices, loc_indices], dtype=torch.long)
+    dev = edge_index.device
+    new_item_loc_edges = torch.tensor([item_indices, loc_indices], dtype=torch.long, device=dev)
 
     # Create edge attributes for new Item->Loc edges with proper normalization
     n_new_edges = n_items * n_storage
-    new_edge_attr = torch.zeros(n_new_edges, 3)
+    new_edge_attr = torch.zeros(n_new_edges, 3, device=dev)
     new_edge_attr[:, 0] = dim0_norm
     new_edge_attr[:, 1] = dim1_norm
     new_edge_attr[:, 2] = dim2_not_assigned
 
     # Create edge type mask for new edges
-    new_edge_type_mask = torch.zeros(n_new_edges, 3, dtype=torch.bool)
+    new_edge_type_mask = torch.zeros(n_new_edges, 3, dtype=torch.bool, device=dev)
     new_edge_type_mask[:, 2] = True  # All are Item->Loc type
 
     # Concatenate
