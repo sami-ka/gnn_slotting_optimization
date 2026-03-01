@@ -326,6 +326,8 @@ class GraphRegressionModel(nn.Module):
             edge_index = data.edge_index
             edge_attr = data.edge_attr
             batch = data.batch
+            if batch is None:
+                batch = torch.zeros(data.num_nodes, dtype=torch.long, device=edge_index.device)
 
             # Read precomputed features
             node_type = data.node_type
