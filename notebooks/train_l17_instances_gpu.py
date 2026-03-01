@@ -166,7 +166,7 @@ def print_phase_evaluation(eval_result: PhaseEvaluation, optimal_distance: float
 
 class EdgeThenNodeLayer(MessagePassing):
     def __init__(self, node_dim, edge_dim):
-        super().__init__(aggr="add")
+        super().__init__(aggr="mean")
         self.edge_mlp = nn.Sequential(
             nn.Linear(2 * node_dim + edge_dim, edge_dim),
             nn.ReLU(),
@@ -190,7 +190,7 @@ class EdgeThenNodeLayer(MessagePassing):
 
 class NodeThenEdgeLayer(MessagePassing):
     def __init__(self, node_dim, edge_dim):
-        super().__init__(aggr="add")
+        super().__init__(aggr="mean")
         self.node_mlp = nn.Sequential(
             nn.Linear(node_dim + edge_dim, node_dim),
             nn.ReLU(),
