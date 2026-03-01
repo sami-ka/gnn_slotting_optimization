@@ -86,7 +86,7 @@ def get_gnn_predictions(model, dataset: list, mean_y: float, std_y: float, devic
     with torch.no_grad():
         for data in dataset:
             if device is not None:
-                data = data.to(device)
+                data = data.clone().to(device)
             pred_norm = model(data)
             pred = pred_norm.item() * std_y + mean_y
             predictions.append(pred)
@@ -394,8 +394,8 @@ def get_config_for_instance(n_items: int, n_locations: int) -> dict:
         "batch_size": 8,
         "grad_clip": 1.0,
         "track_every_n_epochs": 5,
-        "epochs_phase1": max(30, int(10 * complexity_ratio)),
-        "epochs_per_aug_phase": max(20, int(7 * complexity_ratio)),
+        "epochs_phase1": max(30, int(8 * complexity_ratio)),
+        "epochs_per_aug_phase": max(20, int(5 * complexity_ratio)),
         "learning_rate": 0.001,
         "n_augmentation_phases": 5,
         "n_top_for_inverse_opt": 15,
