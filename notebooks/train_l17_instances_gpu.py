@@ -38,10 +38,13 @@ from slotting_optimization.instance_loader import load_l17_instance, load_single
 from slotting_optimization.gnn_builder import build_graph_3d_sparse
 from slotting_optimization.simulator import Simulator
 from slotting_optimization.inverse_optimizer import (
-    optimize_assignment,
     assignment_to_graph_data,
     extract_current_assignment,
+    create_dense_assignment_graph,
+    inject_soft_assignment,
+    sinkhorn,
 )
+from scipy.optimize import linear_sum_assignment as scipy_lsa
 from slotting_optimization.item_locations import ItemLocations
 from slotting_optimization.validation.scenario import ValidationScenario
 from dataclasses import dataclass
@@ -391,8 +394,8 @@ def get_config_for_instance(n_items: int, n_locations: int) -> dict:
         "batch_size": 8,
         "grad_clip": 1.0,
         "track_every_n_epochs": 5,
-        "epochs_phase1": max(30, int(15 * complexity_ratio)),
-        "epochs_per_aug_phase": max(20, int(10 * complexity_ratio)),
+        "epochs_phase1": max(30, int(10 * complexity_ratio)),
+        "epochs_per_aug_phase": max(20, int(7 * complexity_ratio)),
         "learning_rate": 0.001,
         "n_augmentation_phases": 5,
         "n_top_for_inverse_opt": 15,
@@ -432,12 +435,110 @@ def evaluate(model, test_loader, criterion, device):
     return total_loss / n_samples
 
 
+class AssignmentOptimizer:
+    """Gradient-based assignment optimizer for GraphRegressionModel.
+
+    Encapsulates the model-specific node encoding so that inverse_optimizer.py
+    stays model-agnostic.  The optimization logic (Sinkhorn + Hungarian) is
+    reimplemented here using the shared building blocks from inverse_optimizer.
+    """
+
+    def __init__(self, model: "GraphRegressionModel"):
+        self.model = model
+
+    def _encode_nodes(self, data: Data, device) -> torch.Tensor:
+        node_type = data.node_type.to(device)
+        x_feat = data.x.to(device)
+        with torch.no_grad():
+            type_emb = self.model.node_type_embedding(node_type)
+            return self.model.node_encoder(torch.cat([type_emb, x_feat], dim=1)).detach()
+
+    def optimize(
+        self,
+        data: Data,
+        mean_y: float,
+        std_y: float,
+        n_steps: int = None,
+        lr: float = None,
+        initial_temp: float = 1.0,
+        final_temp: float = 0.01,
+        perturbation_scale: float = 0.0,
+        device: str = "cpu",
+    ) -> dict:
+        model = self.model
+        model.eval()
+
+        n_items = data.n_items
+        n_storage = data.n_storage
+
+        if n_steps is None:
+            n_steps = max(50, n_items * 10)
+        if lr is None:
+            lr = 0.5 / (n_items / 5.0)
+
+        current_assignment = extract_current_assignment(data)
+        dense_data, edge_info = create_dense_assignment_graph(data, n_items, n_storage)
+        dense_data.edge_index = dense_data.edge_index.to(device)
+        dense_data.edge_attr = dense_data.edge_attr.to(device)
+
+        log_alpha = torch.zeros(n_items, n_storage, device=device, requires_grad=True)
+        for item_idx, loc_idx in enumerate(current_assignment):
+            log_alpha.data[item_idx, loc_idx] = 1.0
+        if perturbation_scale > 0:
+            log_alpha.data += torch.randn(n_items, n_storage, device=device) * perturbation_scale
+
+        x = self._encode_nodes(data, device)
+
+        temp_decay = (final_temp / initial_temp) ** (1.0 / n_steps)
+        temp = initial_temp
+
+        for step in range(n_steps):
+            if log_alpha.grad is not None:
+                log_alpha.grad.zero_()
+            soft_assign = sinkhorn(log_alpha, n_iters=max(20, n_items * 3), temperature=temp)
+            edge_attr = inject_soft_assignment(dense_data.edge_attr, soft_assign, edge_info)
+            pred_norm = model(x, dense_data.edge_index, edge_attr)
+            pred_norm.backward()
+            log_alpha.data -= lr * log_alpha.grad
+            temp *= temp_decay
+
+        with torch.no_grad():
+            final_soft = sinkhorn(log_alpha, n_iters=max(50, n_items * 8), temperature=0.01)
+            cost_matrix = -final_soft.cpu().numpy()
+            _, col_ind = scipy_lsa(cost_matrix)
+            final_assignment = col_ind
+
+        # Score original and final
+        original_soft = torch.zeros(n_items, n_storage, device=device)
+        for item_idx, loc_idx in enumerate(current_assignment):
+            original_soft[item_idx, loc_idx] = 1.0
+        final_hard = torch.zeros(n_items, n_storage, device=device)
+        for item_idx, loc_idx in enumerate(final_assignment):
+            final_hard[item_idx, loc_idx] = 1.0
+
+        with torch.no_grad():
+            orig_pred = model(x, dense_data.edge_index,
+                              inject_soft_assignment(dense_data.edge_attr, original_soft, edge_info)
+                              ).item() * std_y + mean_y
+            final_pred = model(x, dense_data.edge_index,
+                               inject_soft_assignment(dense_data.edge_attr, final_hard, edge_info)
+                               ).item() * std_y + mean_y
+
+        return {
+            "original_assignment": current_assignment,
+            "optimized_assignment": final_assignment,
+            "original_distance": orig_pred,
+            "optimized_distance": final_pred,
+            "improvement_pct": (orig_pred - final_pred) / orig_pred * 100,
+        }
+
+
 def augment_dataset(
-    model, top_graphs, top_raw_samples, mean_y, std_y, edge_mean, edge_std,
+    optimizer: AssignmentOptimizer, top_graphs, top_raw_samples, mean_y, std_y, edge_mean, edge_std,
     n_steps=50, existing_assignments=None, perturbation_scale=0.0, device="cpu",
     x_mean=None, x_std=None,
 ) -> tuple:
-    model.eval()
+    optimizer.model.eval()
     simulator = Simulator()
     augmented = []
     augmented_raw_and_graph = []
@@ -445,8 +546,8 @@ def augment_dataset(
         existing_assignments = set()
     n_duplicates = 0
     for data, raw_sample in tqdm(zip(top_graphs, top_raw_samples), total=len(top_graphs), desc="  Augmenting"):
-        result = optimize_assignment(
-            model=model, data=data, mean_y=mean_y, std_y=std_y,
+        result = optimizer.optimize(
+            data=data, mean_y=mean_y, std_y=std_y,
             n_steps=n_steps, perturbation_scale=perturbation_scale,
             device=device,
         )
@@ -656,6 +757,8 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  Parameters: {n_params:,}")
 
+    assignment_optimizer = AssignmentOptimizer(model)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG["learning_rate"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5
@@ -736,7 +839,7 @@ def main():
         print(f"  Selected top {len(top_indices)} from {len(current_train_dataset)} accumulated samples")
 
         augmented, existing_assignments, augmented_raw_and_graph = augment_dataset(
-            model=model, top_graphs=top_graphs, top_raw_samples=top_raw,
+            optimizer=assignment_optimizer, top_graphs=top_graphs, top_raw_samples=top_raw,
             mean_y=mean_y, std_y=std_y,
             edge_mean=edge_mean, edge_std=edge_std,
             n_steps=CONFIG["augmentation_n_steps"],
