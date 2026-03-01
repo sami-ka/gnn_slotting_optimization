@@ -227,30 +227,88 @@ class GCNBlock(nn.Module):
         return x, edge_attr
 
 
+def precompute_node_features(data):
+    """Precompute discriminative node features and store as data.x + data.node_type.
+
+    Features per node (3 dims):
+      1. is_assigned: For locations, 1.0 if an item is assigned there, else 0.0.
+         Items always get 1.0. This signals which locations are "active".
+      2. assignment_loc_index: For items, the normalized index (0–1) of the
+         assigned location. This is the KEY varying feature — it directly
+         encodes WHERE each item is placed, which changes between samples.
+         Locations get 0.0.
+      3. normalized_position: Static positional encoding within type group
+         (linspace 0–1). Helps distinguish between different items/locations.
+
+    Also stores data.node_type: 0=item, 1=storage_loc, 2=control_point.
+    """
+    n_items = data.n_items
+    n_locs = data.n_locs
+    n_storage = data.n_storage
+    num_nodes = data.num_nodes
+    edge_index = data.edge_index
+    edge_type_mask = data.edge_type_mask  # [num_edges, 3]
+
+    # --- Node types ---
+    node_type = torch.zeros(num_nodes, dtype=torch.long)
+    node_type[n_items:n_items + n_storage] = 1  # storage locations
+    node_type[n_items + n_storage:] = 2  # control points (start/end)
+
+    # --- Feature 1: is_assigned ---
+    is_assigned = torch.zeros(num_nodes)
+    # Items are always assigned
+    is_assigned[:n_items] = 1.0
+    # For locations: check if any item->loc edge targets them
+    item_loc_mask = edge_type_mask[:, 2]  # boolean mask for assignment edges
+    if item_loc_mask.any():
+        item_loc_edges = edge_index[:, item_loc_mask]
+        # Targets of item->loc edges are location nodes
+        loc_targets = item_loc_edges[1]
+        is_assigned[loc_targets] = 1.0
+
+    # --- Feature 2: assignment_loc_index (items only) ---
+    assignment_loc_index = torch.zeros(num_nodes)
+    if item_loc_mask.any():
+        item_loc_edges = edge_index[:, item_loc_mask]
+        # For each item->loc edge: source is item, target is location
+        item_sources = item_loc_edges[0]  # item node indices (0..n_items-1)
+        loc_targets = item_loc_edges[1]   # location node indices (n_items..n_items+n_locs-1)
+        # Normalize: location index within location block, scaled to [0, 1]
+        normalized_loc = (loc_targets.float() - n_items) / max(n_locs - 1, 1)
+        assignment_loc_index[item_sources] = normalized_loc
+
+    # --- Feature 3: normalized_position ---
+    position_feat = torch.zeros(num_nodes)
+    if n_items > 1:
+        position_feat[:n_items] = torch.linspace(0, 1, n_items)
+    if n_locs > 1:
+        position_feat[n_items:n_items + n_locs] = torch.linspace(0, 1, n_locs)
+
+    # Store on data object
+    data.x = torch.stack([is_assigned, assignment_loc_index, position_feat], dim=1)  # [N, 3]
+    data.node_type = node_type
+
+
 class GraphRegressionModel(nn.Module):
-    """GNN regression model with per-sample node features and item-only pooling.
+    """GNN regression model with precomputed node features and item-only pooling.
 
-    Instead of positional nn.Embedding (identical across samples), computes
-    node features from the graph structure so that each sample produces
-    different inputs for movable items and their assigned locations.
+    Expects data.x ([N, 3]) and data.node_type ([N]) to be precomputed by
+    precompute_node_features(). The three features are:
+      - is_assigned: whether a location has an item (varies per sample)
+      - assignment_loc_index: WHERE each item is placed (key varying signal)
+      - normalized_position: static positional encoding within type group
 
-    Node features (computed per-sample in forward()):
-      - Type embedding: item=0, storage_location=1, control_point=2
-      - Item nodes: [degree, in_degree_from_locs, normalized_index]
-      - Location nodes: [degree, in_degree_from_items, is_control_point]
-
-    Pooling: Only item nodes are pooled (not all 237 nodes), focusing the
-    readout on the informative part of the graph.
+    Pooling: Only item nodes are pooled (not all 237 nodes).
     """
 
-    NODE_FEAT_DIM = 3  # Per-node features computed from graph structure
+    NODE_FEAT_DIM = 3
 
     def __init__(self, hidden_dim, edge_dim, num_layers, max_nodes=256):
         super().__init__()
         self.hidden_dim = hidden_dim
         # Type embedding: item=0, storage_loc=1, control_point=2
         self.node_type_embedding = nn.Embedding(3, 8)
-        # Encoder: type_embed(8) + structural_features(NODE_FEAT_DIM) -> hidden_dim
+        # Encoder: type_embed(8) + precomputed_features(3) -> hidden_dim
         self.node_encoder = nn.Linear(8 + self.NODE_FEAT_DIM, hidden_dim)
         self.edge_encoder = nn.Linear(edge_dim, hidden_dim)
         self.layers = nn.ModuleList(
@@ -262,114 +320,37 @@ class GraphRegressionModel(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def _compute_node_features(self, data, n_items, n_locs, n_storage, num_nodes, device):
-        """Compute per-node features from graph structure.
-
-        Returns:
-            x: [num_nodes, hidden_dim] encoded node features
-            item_mask: [num_nodes] boolean mask for item nodes
-        """
-        nodes_per_graph = n_items + n_locs
-
-        # --- Node type IDs ---
-        # Build type ids: 0=item, 1=storage_loc, 2=control_point
-        single_type = torch.zeros(nodes_per_graph, dtype=torch.long, device=device)
-        single_type[n_items:n_items + n_storage] = 1  # storage locations
-        single_type[n_items + n_storage:] = 2  # control points (start/end)
-
-        n_graphs = num_nodes // nodes_per_graph
-        type_ids = single_type.repeat(n_graphs)
-
-        type_emb = self.node_type_embedding(type_ids)  # [num_nodes, 8]
-
-        # --- Structural features (vary per sample) ---
-        edge_index = data.edge_index
-        edge_type_mask = data.edge_type_mask  # [num_edges, 3]: loc-loc, item-item, item-loc
-
-        # Feature 1: Node degree (total incoming edges) - normalized
-        degree = torch.zeros(num_nodes, device=device)
-        degree.scatter_add_(0, edge_index[1], torch.ones(edge_index.shape[1], device=device))
-        max_degree = degree.max().clamp(min=1.0)
-        degree_norm = degree / max_degree
-
-        # Feature 2: Type-specific in-degree
-        # For items: count of incoming item-loc edges (= how many locations assigned, always 1 but from different locs per sample)
-        # For locations: count of incoming item-loc edges (= how many items assigned here, 0 or 1)
-        item_loc_edges = edge_index[:, edge_type_mask[:, 2]]  # edges where type is item->loc
-        type_specific_degree = torch.zeros(num_nodes, device=device)
-        if item_loc_edges.shape[1] > 0:
-            # For item->loc edges, target is location node. Count per target.
-            type_specific_degree.scatter_add_(
-                0, item_loc_edges[1],
-                torch.ones(item_loc_edges.shape[1], device=device),
-            )
-            # Also count for source (item nodes): how many locs each item connects to
-            type_specific_degree.scatter_add_(
-                0, item_loc_edges[0],
-                torch.ones(item_loc_edges.shape[1], device=device),
-            )
-
-        # Feature 3: Normalized position within type
-        # Items: index / n_items; Locations: index / n_locs
-        position_feat = torch.zeros(num_nodes, device=device)
-        for g in range(n_graphs):
-            offset = g * nodes_per_graph
-            # Item positions
-            if n_items > 1:
-                position_feat[offset:offset + n_items] = torch.linspace(
-                    0, 1, n_items, device=device
-                )
-            # Location positions
-            if n_locs > 1:
-                position_feat[offset + n_items:offset + nodes_per_graph] = torch.linspace(
-                    0, 1, n_locs, device=device
-                )
-
-        # Stack structural features
-        struct_feat = torch.stack([degree_norm, type_specific_degree, position_feat], dim=1)  # [num_nodes, 3]
-
-        # Concatenate type embedding + structural features -> encode
-        node_input = torch.cat([type_emb, struct_feat], dim=1)  # [num_nodes, 8 + 3]
-        x = self.node_encoder(node_input)  # [num_nodes, hidden_dim]
-
-        # Item mask for pooling
-        single_item_mask = torch.zeros(nodes_per_graph, dtype=torch.bool, device=device)
-        single_item_mask[:n_items] = True
-        item_mask = single_item_mask.repeat(n_graphs)
-
-        return x, item_mask
-
     def forward(self, data_or_x, edge_index=None, edge_attr=None, batch=None):
         if isinstance(data_or_x, Data):
             data = data_or_x
             edge_index = data.edge_index
             edge_attr = data.edge_attr
-            num_nodes = data.num_nodes
             batch = data.batch
-            if hasattr(data, "batch") and data.batch is not None:
-                n_items = (
-                    data.n_items[0].item()
-                    if isinstance(data.n_items, torch.Tensor)
-                    else data.n_items
-                )
-                n_locs = (
-                    data.n_locs[0].item()
-                    if isinstance(data.n_locs, torch.Tensor)
-                    else data.n_locs
-                )
-                n_storage = (
-                    data.n_storage[0].item()
-                    if isinstance(data.n_storage, torch.Tensor)
-                    else data.n_storage
-                )
-            else:
-                n_items = data.n_items
-                n_locs = data.n_locs
-                n_storage = data.n_storage
 
-            x, item_mask = self._compute_node_features(
-                data, n_items, n_locs, n_storage, num_nodes, edge_index.device
+            # Read precomputed features
+            node_type = data.node_type
+            x_feat = data.x  # [N, 3]
+
+            # Build item mask for pooling
+            n_items = (
+                data.n_items[0].item()
+                if isinstance(data.n_items, torch.Tensor)
+                else data.n_items
             )
+            n_locs = (
+                data.n_locs[0].item()
+                if isinstance(data.n_locs, torch.Tensor)
+                else data.n_locs
+            )
+            nodes_per_graph = n_items + n_locs
+            n_graphs = data.num_nodes // nodes_per_graph
+            single_item_mask = torch.zeros(nodes_per_graph, dtype=torch.bool, device=edge_index.device)
+            single_item_mask[:n_items] = True
+            item_mask = single_item_mask.repeat(n_graphs)
+
+            # Encode: type_embedding + precomputed features
+            type_emb = self.node_type_embedding(node_type)  # [N, 8]
+            x = self.node_encoder(torch.cat([type_emb, x_feat], dim=1))  # [N, hidden]
         else:
             x = data_or_x
             item_mask = None
@@ -452,6 +433,7 @@ def evaluate(model, test_loader, criterion, device):
 def augment_dataset(
     model, top_graphs, top_raw_samples, mean_y, std_y, edge_mean, edge_std,
     n_steps=50, existing_assignments=None, perturbation_scale=0.0, device="cpu",
+    x_mean=None, x_std=None,
 ) -> tuple:
     model.eval()
     simulator = Simulator()
@@ -477,6 +459,10 @@ def augment_dataset(
             edge_mean=edge_mean, edge_std=edge_std,
             mean_y=mean_y, std_y=std_y,
         )
+        # Precompute and normalize node features for augmented graph
+        precompute_node_features(graph_data)
+        if x_mean is not None and x_std is not None:
+            graph_data.x = (graph_data.x - x_mean) / (x_std + 1e-8)
         augmented.append(graph_data)
         augmented_raw_and_graph.append((raw_sample, graph_data))
     print(f"  Generated {len(augmented)} augmented samples ({n_duplicates} duplicates skipped)")
@@ -605,6 +591,22 @@ def main():
         )
         list_data.append(g_data)
 
+    # Precompute node features (discriminative per-sample features)
+    print("  Precomputing node features...")
+    for d in list_data:
+        precompute_node_features(d)
+
+    # Sanity check: verify features differ between samples
+    if len(list_data) >= 2:
+        x0 = list_data[0].x
+        x1 = list_data[1].x
+        n_items_check = list_data[0].n_items
+        print(f"  Sanity check — assignment_loc_index (col 1) for first {n_items_check} items:")
+        print(f"    Sample 0: {x0[:n_items_check, 1].tolist()}")
+        print(f"    Sample 1: {x1[:n_items_check, 1].tolist()}")
+        differ = not torch.allclose(x0[:n_items_check, 1], x1[:n_items_check, 1])
+        print(f"    Features differ: {differ}")
+
     # Split
     split_idx = int(len(list_data) * CONFIG["train_split"])
     train_dataset = list_data[:split_idx]
@@ -623,6 +625,14 @@ def main():
 
     for d in train_dataset + test_dataset:
         d.y = (d.y - mean_y) / std_y
+
+    # Normalize node features (data.x)
+    all_x = torch.cat([d.x for d in train_dataset], dim=0)
+    x_mean = all_x.mean(dim=0)
+    x_std = all_x.std(dim=0)
+    print(f"  Node features: mean={x_mean.tolist()}, std={x_std.tolist()}")
+    for d in train_dataset + test_dataset:
+        d.x = (d.x - x_mean) / (x_std + 1e-8)
 
     all_edge_attrs = torch.cat([d.edge_attr for d in train_dataset], dim=0)
     edge_mean = all_edge_attrs.mean(dim=0)
@@ -731,6 +741,7 @@ def main():
             existing_assignments=existing_assignments,
             perturbation_scale=CONFIG["perturbation_scale"],
             device=str(device),
+            x_mean=x_mean, x_std=x_std,
         )
 
         print(f"\n[...] Augmentation Phase {aug_phase_num}: Training...")
