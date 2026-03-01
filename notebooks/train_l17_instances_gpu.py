@@ -219,16 +219,39 @@ class GCNBlock(nn.Module):
         self.node_then_edge = NodeThenEdgeLayer(node_dim, edge_dim)
 
     def forward(self, x, edge_index, edge_attr):
+        x_res, edge_attr_res = x, edge_attr
         x, edge_attr = self.edge_then_node(x, edge_index, edge_attr)
         x, edge_attr = self.node_then_edge(x, edge_index, edge_attr)
+        x = x + x_res  # Residual connection
+        edge_attr = edge_attr + edge_attr_res
         return x, edge_attr
 
 
 class GraphRegressionModel(nn.Module):
+    """GNN regression model with per-sample node features and item-only pooling.
+
+    Instead of positional nn.Embedding (identical across samples), computes
+    node features from the graph structure so that each sample produces
+    different inputs for movable items and their assigned locations.
+
+    Node features (computed per-sample in forward()):
+      - Type embedding: item=0, storage_location=1, control_point=2
+      - Item nodes: [degree, in_degree_from_locs, normalized_index]
+      - Location nodes: [degree, in_degree_from_items, is_control_point]
+
+    Pooling: Only item nodes are pooled (not all 237 nodes), focusing the
+    readout on the informative part of the graph.
+    """
+
+    NODE_FEAT_DIM = 3  # Per-node features computed from graph structure
+
     def __init__(self, hidden_dim, edge_dim, num_layers, max_nodes=256):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.node_embedding = nn.Embedding(max_nodes, hidden_dim)
+        # Type embedding: item=0, storage_loc=1, control_point=2
+        self.node_type_embedding = nn.Embedding(3, 8)
+        # Encoder: type_embed(8) + structural_features(NODE_FEAT_DIM) -> hidden_dim
+        self.node_encoder = nn.Linear(8 + self.NODE_FEAT_DIM, hidden_dim)
         self.edge_encoder = nn.Linear(edge_dim, hidden_dim)
         self.layers = nn.ModuleList(
             [GCNBlock(hidden_dim, hidden_dim) for _ in range(num_layers)]
@@ -238,6 +261,83 @@ class GraphRegressionModel(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
+
+    def _compute_node_features(self, data, n_items, n_locs, n_storage, num_nodes, device):
+        """Compute per-node features from graph structure.
+
+        Returns:
+            x: [num_nodes, hidden_dim] encoded node features
+            item_mask: [num_nodes] boolean mask for item nodes
+        """
+        nodes_per_graph = n_items + n_locs
+
+        # --- Node type IDs ---
+        # Build type ids: 0=item, 1=storage_loc, 2=control_point
+        single_type = torch.zeros(nodes_per_graph, dtype=torch.long, device=device)
+        single_type[n_items:n_items + n_storage] = 1  # storage locations
+        single_type[n_items + n_storage:] = 2  # control points (start/end)
+
+        n_graphs = num_nodes // nodes_per_graph
+        type_ids = single_type.repeat(n_graphs)
+
+        type_emb = self.node_type_embedding(type_ids)  # [num_nodes, 8]
+
+        # --- Structural features (vary per sample) ---
+        edge_index = data.edge_index
+        edge_type_mask = data.edge_type_mask  # [num_edges, 3]: loc-loc, item-item, item-loc
+
+        # Feature 1: Node degree (total incoming edges) - normalized
+        degree = torch.zeros(num_nodes, device=device)
+        degree.scatter_add_(0, edge_index[1], torch.ones(edge_index.shape[1], device=device))
+        max_degree = degree.max().clamp(min=1.0)
+        degree_norm = degree / max_degree
+
+        # Feature 2: Type-specific in-degree
+        # For items: count of incoming item-loc edges (= how many locations assigned, always 1 but from different locs per sample)
+        # For locations: count of incoming item-loc edges (= how many items assigned here, 0 or 1)
+        item_loc_edges = edge_index[:, edge_type_mask[:, 2]]  # edges where type is item->loc
+        type_specific_degree = torch.zeros(num_nodes, device=device)
+        if item_loc_edges.shape[1] > 0:
+            # For item->loc edges, target is location node. Count per target.
+            type_specific_degree.scatter_add_(
+                0, item_loc_edges[1],
+                torch.ones(item_loc_edges.shape[1], device=device),
+            )
+            # Also count for source (item nodes): how many locs each item connects to
+            type_specific_degree.scatter_add_(
+                0, item_loc_edges[0],
+                torch.ones(item_loc_edges.shape[1], device=device),
+            )
+
+        # Feature 3: Normalized position within type
+        # Items: index / n_items; Locations: index / n_locs
+        position_feat = torch.zeros(num_nodes, device=device)
+        for g in range(n_graphs):
+            offset = g * nodes_per_graph
+            # Item positions
+            if n_items > 1:
+                position_feat[offset:offset + n_items] = torch.linspace(
+                    0, 1, n_items, device=device
+                )
+            # Location positions
+            if n_locs > 1:
+                position_feat[offset + n_items:offset + nodes_per_graph] = torch.linspace(
+                    0, 1, n_locs, device=device
+                )
+
+        # Stack structural features
+        struct_feat = torch.stack([degree_norm, type_specific_degree, position_feat], dim=1)  # [num_nodes, 3]
+
+        # Concatenate type embedding + structural features -> encode
+        node_input = torch.cat([type_emb, struct_feat], dim=1)  # [num_nodes, 8 + 3]
+        x = self.node_encoder(node_input)  # [num_nodes, hidden_dim]
+
+        # Item mask for pooling
+        single_item_mask = torch.zeros(nodes_per_graph, dtype=torch.bool, device=device)
+        single_item_mask[:n_items] = True
+        item_mask = single_item_mask.repeat(n_graphs)
+
+        return x, item_mask
 
     def forward(self, data_or_x, edge_index=None, edge_attr=None, batch=None):
         if isinstance(data_or_x, Data):
@@ -257,21 +357,35 @@ class GraphRegressionModel(nn.Module):
                     if isinstance(data.n_locs, torch.Tensor)
                     else data.n_locs
                 )
+                n_storage = (
+                    data.n_storage[0].item()
+                    if isinstance(data.n_storage, torch.Tensor)
+                    else data.n_storage
+                )
             else:
                 n_items = data.n_items
                 n_locs = data.n_locs
-            nodes_per_graph = n_items + n_locs
-            node_ids = (
-                torch.arange(num_nodes, dtype=torch.long, device=edge_index.device)
-                % nodes_per_graph
+                n_storage = data.n_storage
+
+            x, item_mask = self._compute_node_features(
+                data, n_items, n_locs, n_storage, num_nodes, edge_index.device
             )
-            x = self.node_embedding(node_ids)
         else:
             x = data_or_x
+            item_mask = None
+
         edge_attr_enc = self.edge_encoder(edge_attr)
         for layer in self.layers:
             x, edge_attr_enc = layer(x, edge_index, edge_attr_enc)
-        graph_emb = global_mean_pool(x, batch)
+
+        # Item-only pooling: focus readout on item nodes, not all 237 nodes
+        if item_mask is not None:
+            item_x = x[item_mask]
+            item_batch = batch[item_mask]
+            graph_emb = global_mean_pool(item_x, item_batch)
+        else:
+            graph_emb = global_mean_pool(x, batch)
+
         out = self.regressor(graph_emb)
         return out.squeeze(-1)
 
@@ -296,7 +410,7 @@ def get_config_for_instance(n_items: int, n_locations: int) -> dict:
         "track_every_n_epochs": 5,
         "epochs_phase1": max(30, int(30 * complexity_ratio)),
         "epochs_per_aug_phase": max(20, int(20 * complexity_ratio)),
-        "learning_rate": 0.001 / (n_items / 5.0),
+        "learning_rate": 0.001,
         "n_augmentation_phases": 5,
         "n_top_for_inverse_opt": 15,
         "perturbation_scale": 1.0,
