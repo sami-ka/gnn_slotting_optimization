@@ -22,7 +22,7 @@ GPU version: Automatically uses CUDA if available.
 
 import torch
 import torch.nn as nn
-from torch_geometric.nn import MessagePassing, global_add_pool
+from torch_geometric.nn import MessagePassing, global_mean_pool
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data
 from tqdm import tqdm
@@ -271,7 +271,7 @@ class GraphRegressionModel(nn.Module):
         edge_attr_enc = self.edge_encoder(edge_attr)
         for layer in self.layers:
             x, edge_attr_enc = layer(x, edge_index, edge_attr_enc)
-        graph_emb = global_add_pool(x, batch)
+        graph_emb = global_mean_pool(x, batch)
         out = self.regressor(graph_emb)
         return out.squeeze(-1)
 
