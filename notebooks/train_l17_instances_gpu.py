@@ -405,7 +405,7 @@ def get_config_for_instance(n_items: int, n_locations: int) -> dict:
         "seed": 42,
         "hidden_dim": 32,
         "num_layers": 3,
-        "batch_size": 32,
+        "batch_size": 8,
         "grad_clip": 1.0,
         "track_every_n_epochs": 5,
         "epochs_phase1": max(30, int(30 * complexity_ratio)),
